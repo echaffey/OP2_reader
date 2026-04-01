@@ -1,0 +1,468 @@
+﻿# op2_native/decoders/oef1.py
+"""
+Decoder for OEF1 / OEF1X element force data blocks.
+
+Layout (SORT1, real, static or modal):
+  Each record is a flat array of 4-byte words.
+  Every row has the form:
+
+      [packed_id, grid_or_cen, n_corners, F1..F8]  (11 words for CQUAD4/CTRIA3)
+  or
+      [packed_id, F1..F8]                          (9 words for CBAR etc.)
+
+  where packed_id = 10 * EID + device_code.
+
+Element-type column names (per Nastran QRG)
+-------------------------------------------
+CQUAD4 / CTRIA3 (etype 33, 73, 74, 144):   11 words/elem
+  NX  = membrane force x (force/length)
+  NY  = membrane force y (force/length)
+  NXY = membrane shear force (force/length)
+  MX  = bending moment x (force·length/length)
+  MY  = bending moment y (force·length/length)
+  MXY = twisting moment (force·length/length)
+  QX  = transverse shear force x (force/length)
+  QY  = transverse shear force y (force/length)
+
+CBAR (etype 34):                            9 words/elem
+  BM1A, BM2A, BM1B, BM2B, TS1, TS2, AF, TRQ
+
+CBEAM (etype 2):                            9 words/elem (centroid only in OEF1)
+  BM1A, BM2A, BM1B, BM2B, TS1, TS2, AF, TRQ
+
+Generic fallback:                           9 words/elem
+  F1..F8
+"""
+from __future__ import annotations
+
+import struct
+from typing import Dict, List, Optional
+
+import pandas as pd
+
+from ..models import OP2Inventory
+from .oes_peek import load_data_bytes, first_data_record_after_ekey
+
+# ---------------------------------------------------------------------------
+# Column name tables per element type
+# ---------------------------------------------------------------------------
+_CQUAD4_FORCE_COLS = ["EID", "NX", "NY", "NXY", "MX", "MY", "MXY", "QX", "QY"]
+_CBAR_FORCE_COLS = ["EID", "BM1A", "BM2A", "BM1B", "BM2B", "TS1", "TS2", "AF", "TRQ"]
+_CBUSH_FORCE_COLS = ["EID", "FX", "FY", "FZ", "MX", "MY", "MZ"]
+_GENERIC_FORCE_COLS = ["EID", "LOC", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8"]
+
+# CBEAM per-station force output (OEF1 NUMWDE=100, one row per active station)
+_CBEAM_FORCE_COLS = ["EID", "GRID", "SD", "BM1", "BM2", "WS1", "WS2", "AF", "TRQ"]
+_CBEAM_OEF_NUM_WIDE = 100  # 1 packed_eid + 11 stations × 9 words/station
+_CBEAM_OEF_STATIONS = 11
+_CBEAM_OEF_WORDS_PER_STATION = 9
+
+# Shell element types
+_SHELL_ETYPES = {33, 73, 74, 144, 64, 75, 82, 70}
+# Bar/beam element types
+_BAR_ETYPES = {2, 34, 100}
+# Bush/spring element types
+_BUSH_ETYPES = {102}  # CBUSH
+
+
+def _force_cols_for_etype(etype: Optional[int]) -> List[str]:
+    """Return the appropriate column list for a given element type."""
+    if etype in _SHELL_ETYPES:
+        return _CQUAD4_FORCE_COLS
+    if etype in _BAR_ETYPES:
+        return _CBAR_FORCE_COLS
+    if etype in _BUSH_ETYPES:
+        return _CBUSH_FORCE_COLS
+    return _GENERIC_FORCE_COLS
+
+
+def _etype_for_oef_header(inv: OP2Inventory, start_index: int) -> Optional[int]:
+    """Return element type from a 584-byte EKEY record.
+
+    If ``start_index`` is itself a 584-byte EKEY record it is read directly;
+    otherwise the records following ``start_index`` are scanned.
+    """
+    from .oes_search import _etype_from_ekey_words
+    rec = inv.records[start_index]
+    if rec.info.length == 584:
+        words = struct.unpack("<146i", rec.data)
+        return _etype_from_ekey_words(words)
+    for i in range(start_index + 1, min(len(inv.records), start_index + 30)):
+        rec = inv.records[i]
+        if rec.info.length == 584:
+            words = struct.unpack("<146i", rec.data)
+            return _etype_from_ekey_words(words)
+    return None
+
+
+def classify_oef_headers(inv: OP2Inventory):
+    """
+    Classify every OEF1* element-type sub-block by element category.
+
+    Returns
+    -------
+    shell_blocks, bar_blocks, bush_blocks, other_blocks
+        Each is a list of ``(header_idx, ekey_idx, sc_offset)`` 3-tuples.
+    """
+    from .oes_search import find_oef_tables, _find_ekeys_in_table
+
+    tables = find_oef_tables(inv)
+    all_hdrs = sorted(idx for hits in tables.values() for idx in hits)
+    shells, bars, bushes, others = [], [], [], []
+    for hdr in all_hdrs:
+        etype_count: dict = {}
+        for ekey_idx, _first_data, etype, _numwde in _find_ekeys_in_table(inv, hdr):
+            sc_offset = etype_count.get(etype, 0)
+            etype_count[etype] = sc_offset + 1
+            entry = (hdr, ekey_idx, sc_offset)
+            if etype in _SHELL_ETYPES:
+                shells.append(entry)
+            elif etype in _BAR_ETYPES:
+                bars.append(entry)
+            elif etype in _BUSH_ETYPES:
+                bushes.append(entry)
+            else:
+                others.append(entry)
+    return shells, bars, bushes, others
+
+
+# ---------------------------------------------------------------------------
+# Payload decoders
+# ---------------------------------------------------------------------------
+
+
+def _decode_oef1_shell_payload(
+    payload: bytes,
+    endian: str = "<",
+    float_thr: float = 1e-6,
+    max_eid: int = 1_000_000,
+) -> pd.DataFrame:
+    """
+    Decode CQUAD4/CTRIA3 element forces: 11 words per element.
+
+    Word layout per centroid row:
+      [packed_eid, CEN/(4bytes), n_corners, NX, NY, NXY, MX, MY, MXY, QX, QY]
+    Only the centroid row is returned (identified by the 3-word near-zero
+    float marker that precedes each element in this OP2 variant).
+    """
+    import numpy as np
+
+    n_words = len(payload) // 4
+    cols = _CQUAD4_FORCE_COLS
+    if n_words < 11:
+        return pd.DataFrame(columns=cols)
+
+    bo = "<" if endian == "<" else ">"
+    floats = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}f4")
+    words_i = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}i4")
+    words_u = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}u4")
+
+    # Vectorised marker detection
+    near_zero = np.abs(floats) < float_thr
+    matches = np.where(near_zero[:-2] & near_zero[1:-1] & near_zero[2:])[0].tolist()
+
+    rows: List[list] = []
+    seen: set = set()
+
+    if matches:
+        for m in matches:
+            found = None
+            for j in range(3):
+                idx = m + j
+                if idx >= n_words:
+                    break
+                for val in (int(words_u[idx]), int(words_i[idx])):
+                    if val >= 10:
+                        loc = val % 10
+                        eid = val // 10
+                        if 1 <= loc <= 9 and 1 <= eid <= max_eid:
+                            found = eid
+                            break
+                if found:
+                    break
+            if not found or found in seen:
+                continue
+            start_f = m + 3
+            if start_f + 8 <= n_words:
+                forces = floats[start_f : start_f + 8]
+                if not np.all(np.isfinite(forces)):
+                    continue
+                rows.append([found] + forces.tolist())
+                seen.add(found)
+
+    # Conventional fixed-stride fallback (stride=11)
+    if not rows:
+        stride = 11
+        for offset in range(0, n_words - stride + 1, stride):
+            raw_id = int(words_i[offset])
+            if raw_id >= 10:
+                loc = raw_id % 10
+                eid = raw_id // 10
+                if 1 <= loc <= 9 and 1 <= eid <= max_eid:
+                    forces = floats[offset + 3 : offset + 11]
+                    if np.all(np.isfinite(forces)):
+                        rows.append([eid] + forces.tolist())
+
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _decode_oef1_bar_payload(
+    payload: bytes,
+    endian: str = "<",
+    float_thr: float = 1e-6,
+    max_eid: int = 1_000_000,
+) -> pd.DataFrame:
+    """
+    Decode CBAR/CBEAM element forces: 9 words per element.
+
+    Word layout: [packed_eid, BM1A, BM2A, BM1B, BM2B, TS1, TS2, AF, TRQ]
+    """
+    import numpy as np
+
+    n_words = len(payload) // 4
+    cols = _CBAR_FORCE_COLS
+    if n_words < 9:
+        return pd.DataFrame(columns=cols)
+
+    bo = "<" if endian == "<" else ">"
+    floats = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}f4")
+    words_i = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}i4")
+
+    rows: List[list] = []
+    stride = 9
+    for offset in range(0, n_words - stride + 1, stride):
+        raw_id = int(words_i[offset])
+        if raw_id >= 10:
+            loc = raw_id % 10
+            eid = raw_id // 10
+            if 1 <= loc <= 9 and 1 <= eid <= max_eid:
+                forces = floats[offset + 1 : offset + 9]
+                if np.all(np.isfinite(forces)):
+                    rows.append([eid] + forces.tolist())
+
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _decode_oef1_bush_payload(
+    payload: bytes,
+    endian: str = "<",
+    max_eid: int = 1_000_000,
+) -> pd.DataFrame:
+    """
+    Decode CBUSH element forces: 7 words per element.
+
+    Word layout: [packed_eid, FX, FY, FZ, MX, MY, MZ]
+    where packed_eid = 10 * EID + device_code.
+    """
+    import numpy as np
+
+    n_words = len(payload) // 4
+    cols = _CBUSH_FORCE_COLS
+    if n_words < 7:
+        return pd.DataFrame(columns=cols)
+
+    bo = "<" if endian == "<" else ">"
+    floats = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}f4")
+    words_i = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}i4")
+
+    rows: List[list] = []
+    stride = 7
+    for offset in range(0, n_words - stride + 1, stride):
+        raw_id = int(words_i[offset])
+        if raw_id >= 10:
+            eid = raw_id // 10
+            if 1 <= eid <= max_eid:
+                forces = floats[offset + 1 : offset + 7]
+                if np.all(np.isfinite(forces)):
+                    rows.append([eid] + forces.tolist())
+
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _decode_oef1_generic_payload(
+    payload: bytes,
+    endian: str = "<",
+    float_thr: float = 1e-6,
+    max_eid: int = 1_000_000,
+) -> pd.DataFrame:
+    """Decode OEF1 with generic F1..F8 column names (fallback for unknown types)."""
+    import numpy as np
+
+    n_words = len(payload) // 4
+    cols = _GENERIC_FORCE_COLS
+    if n_words < 9:
+        return pd.DataFrame(columns=cols)
+
+    bo = "<" if endian == "<" else ">"
+    floats = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}f4")
+    words_i = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}i4")
+    words_u = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}u4")
+
+    near_zero = np.abs(floats) < float_thr
+    matches = np.where(near_zero[:-2] & near_zero[1:-1] & near_zero[2:])[0].tolist()
+
+    rows: List[list] = []
+    seen: set = set()
+
+    if matches:
+        for m in matches:
+            found = None
+            for j in range(3):
+                idx = m + j
+                if idx >= n_words:
+                    break
+                for val in (int(words_u[idx]), int(words_i[idx])):
+                    if val >= 10:
+                        loc = val % 10
+                        eid = val // 10
+                        if 1 <= loc <= 9 and 1 <= eid <= max_eid:
+                            found = (eid, loc)
+                            break
+                if found:
+                    break
+            if not found or found[0] in seen:
+                continue
+            start_f = m + 3
+            if start_f + 8 <= n_words:
+                forces = floats[start_f : start_f + 8]
+                if not np.all(np.isfinite(forces)):
+                    continue
+                rows.append([found[0], found[1]] + forces.tolist())
+                seen.add(found[0])
+
+    if not rows:
+        for offset in range(0, n_words - 8, 9):
+            raw_id = int(words_i[offset])
+            if raw_id >= 10:
+                loc = raw_id % 10
+                eid = raw_id // 10
+                if 1 <= loc <= 9 and 1 <= eid <= max_eid:
+                    forces = floats[offset + 1 : offset + 9]
+                    if np.all(np.isfinite(forces)):
+                        rows.append([eid, loc] + forces.tolist())
+
+    return pd.DataFrame(rows, columns=cols)
+
+
+# ---------------------------------------------------------------------------
+# CBEAM per-station force decoder (NUMWDE = 100)
+# ---------------------------------------------------------------------------
+
+
+def _decode_oef1_cbeam_payload(
+    payload: bytes,
+    endian: str = "<",
+    max_eid: int = 10_000_000,
+) -> pd.DataFrame:
+    """
+    Decode CBEAM element forces from OEF1.
+
+    Layout: NUMWDE=100 words per element.
+      Word 0       : packed_eid_device  (10*EID + device_code)
+      Words 1-99   : 11 stations x 9 words each
+                     [GRID, SD, BM1, BM2, WS1, WS2, AF, TRQ, WARPING]
+
+    Stations where GRID==0 AND SD==0.0 are padding rows and are skipped.
+    WARPING is stored but dropped from the output (zero in static analyses).
+    """
+    import numpy as np
+
+    n_words = len(payload) // 4
+    stride = _CBEAM_OEF_NUM_WIDE
+    n_per_station = _CBEAM_OEF_WORDS_PER_STATION
+    n_stations = _CBEAM_OEF_STATIONS
+
+    if n_words < stride:
+        return pd.DataFrame(columns=_CBEAM_FORCE_COLS)
+
+    bo = "<" if endian == "<" else ">"
+    ints = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}i4")
+    floats = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}f4")
+
+    rows: List[list] = []
+    n_elems = n_words // stride
+    for elem in range(n_elems):
+        base = elem * stride
+        raw = int(ints[base])
+        if raw <= 0:
+            break
+        eid = raw // 10
+        loc = raw % 10
+        if not (1 <= loc <= 9 and 1 <= eid <= max_eid):
+            break
+
+        for st in range(n_stations):
+            st_base = base + 1 + st * n_per_station
+            grid = int(ints[st_base])
+            sd = float(floats[st_base + 1])
+            if grid == 0 and sd == 0.0:
+                continue
+            bm1 = float(floats[st_base + 2])
+            bm2 = float(floats[st_base + 3])
+            ws1 = float(floats[st_base + 4])
+            ws2 = float(floats[st_base + 5])
+            af  = float(floats[st_base + 6])
+            trq = float(floats[st_base + 7])
+            # WARPING at st_base+8 is always zero for static analysis, skip
+            rows.append([eid, grid, sd, bm1, bm2, ws1, ws2, af, trq])
+
+    return pd.DataFrame(rows, columns=_CBEAM_FORCE_COLS)
+
+
+# ---------------------------------------------------------------------------
+# Public decoder
+# ---------------------------------------------------------------------------
+
+
+def decode_oef1(inv: OP2Inventory, header_index: int, ekey_index: int = None) -> pd.DataFrame:
+    """
+    Decode an OEF1 element force block.
+
+    The element type is read from the EKEY record to select the correct
+    column names:
+
+    * CQUAD4/CTRIA3 shell elements:
+      ``EID, NX, NY, NXY, MX, MY, MXY, QX, QY``
+    * CBAR/CBEAM bar elements:
+      ``EID, BM1A, BM2A, BM1B, BM2B, TS1, TS2, AF, TRQ``
+    * Unknown element types:
+      ``EID, LOC, F1 ... F8``
+    """
+    etype = _etype_for_oef_header(
+        inv, ekey_index if ekey_index is not None else header_index
+    )
+    if ekey_index is not None:
+        first_idx = first_data_record_after_ekey(inv, ekey_index)
+        payload, data_idx, _all_recs = load_data_bytes(
+            inv, ekey_index, first_idx=first_idx
+        )
+    else:
+        payload, data_idx, _all_recs = load_data_bytes(inv, header_index)
+
+    # Determine NUMWDE to choose the correct per-element stride
+    numwde = None
+    if ekey_index is not None:
+        rec_e = inv.records[ekey_index]
+        if rec_e.info.length == 584:
+            import struct as _struct
+            numwde = _struct.unpack("<146i", rec_e.data)[9]
+
+    if etype in _SHELL_ETYPES:
+        df = _decode_oef1_shell_payload(payload, endian=inv.endian)
+    elif etype in _BAR_ETYPES:
+        # CBEAM uses a per-station layout (NUMWDE=100) identical in spirit to the
+        # OES stress layout.  CBAR uses the simpler 9-word/element layout.
+        if etype == 2 and numwde == _CBEAM_OEF_NUM_WIDE:
+            df = _decode_oef1_cbeam_payload(payload, endian=inv.endian)
+        else:
+            df = _decode_oef1_bar_payload(payload, endian=inv.endian)
+    elif etype in _BUSH_ETYPES:
+        df = _decode_oef1_bush_payload(payload, endian=inv.endian)
+    else:
+        df = _decode_oef1_generic_payload(payload, endian=inv.endian)
+
+    df.attrs["header_record"] = header_index
+    df.attrs["data_record"] = data_idx
+    df.attrs["all_data_records"] = _all_recs
+    df.attrs["element_type"] = etype
+    return df
