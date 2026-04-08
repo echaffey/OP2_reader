@@ -41,78 +41,79 @@ from ..models import OP2Inventory
 
 _LAMA_COLS = ["MODE", "ORDER", "EIGENVALUE", "RADIANS", "CYCLES", "GENM", "GENSTIF"]
 
-# Two possible row widths depending on whether EIGENVALUE is stored as
-# float64 (8 bytes = 2 words) or two float32 values (2 words).
-_STRIDE_F64 = 8  # MODE(i4) + ORDER(i4) + EIGENVALUE(f8) + RADIANS(f4) + CYCLES(f4) + GENM(f4) + GENSTIF(f4)
-_STRIDE_F32 = 7  # same but EIGENVALUE as two f4 words
+# Each mode row is 7 x 4-byte words = 28 bytes
+_STRIDE_F32 = 7
 
 
 def _find_lama_headers(inv: OP2Inventory) -> List[int]:
-    """Return record indices of 8-byte LAMA table-name records."""
+    """Return record indices (info.index) of 8-byte LAMA table-name records."""
     return [
         r.info.index for r in inv.records if r.info.length == 8 and b"LAMA" in r.data
     ]
 
 
+def _is_lama_data(data: bytes, endian: str = "<") -> bool:
+    """
+    Return True if *data* looks like a valid LAMA eigenvalue payload.
+
+    A real LAMA data record has N x 7 float32 words (28 bytes/mode):
+        [mode(i4), order(i4), eigenvalue(f4), radians(f4), cycles(f4), genm(f4), gens(f4)]
+
+    Quick validation: length divisible by 28, first word is a small positive
+    integer (mode number), third word is a large positive float (eigenvalue),
+    and sqrt(eigenvalue) ≈ radians within 5 %.
+    """
+    import math
+
+    n = len(data)
+    if n < 28 or n % 28 != 0:
+        return False
+    bo = ">" if endian == ">" else "<"
+    mode = struct.unpack_from(f"{bo}i", data, 0)[0]
+    if not (1 <= mode <= 100_000):
+        return False
+    eig = struct.unpack_from(f"{bo}f", data, 8)[0]
+    rad = struct.unpack_from(f"{bo}f", data, 12)[0]
+    if eig <= 0 or rad <= 0:
+        return False
+    try:
+        expected = math.sqrt(eig)
+    except ValueError:
+        return False
+    return abs(rad - expected) / expected < 0.05
+
+
 def _decode_lama_record(data: bytes, endian: str = "<") -> pd.DataFrame:
     """
-    Decode a single LAMA data record into a DataFrame.
+    Decode a single LAMA data payload into a DataFrame.
 
-    Tries float64 eigenvalue layout first; falls back to float32 if the
-    decoded RADIANS/CYCLES values are inconsistent.
+    NX Nastran stores real eigenvalues with 7 float32 words per mode:
+        word 0 : MODE       int32
+        word 1 : ORDER      int32
+        word 2 : EIGENVALUE float32  (ω², rad²/s²)
+        word 3 : RADIANS    float32  (ω, rad/s)
+        word 4 : CYCLES     float32  (f, Hz)
+        word 5 : GENM       float32  (generalised mass)
+        word 6 : GENSTIF    float32  (generalised stiffness)
     """
-    bo = ">" if endian == ">" else "<"
+    row_bytes = _STRIDE_F32 * 4  # 28 bytes / mode
     n_bytes = len(data)
-
-    rows: List[list] = []
-
-    # Try stride=8 (float64 eigenvalue, 32 bytes per row)
-    row_bytes_f64 = _STRIDE_F64 * 4
-    if n_bytes % row_bytes_f64 == 0 and n_bytes >= row_bytes_f64:
-        n_rows = n_bytes // row_bytes_f64
-        valid = True
-        tmp_rows: List[list] = []
-        for i in range(n_rows):
-            off = i * row_bytes_f64
-            mode = struct.unpack_from(f"{bo}i", data, off)[0]
-            order = struct.unpack_from(f"{bo}i", data, off + 4)[0]
-            eig = struct.unpack_from(f"{bo}d", data, off + 8)[0]  # float64
-            rad = struct.unpack_from(f"{bo}f", data, off + 16)[0]
-            cyc = struct.unpack_from(f"{bo}f", data, off + 20)[0]
-            genm = struct.unpack_from(f"{bo}f", data, off + 24)[0]
-            gens = struct.unpack_from(f"{bo}f", data, off + 28)[0]
-            # Sanity: RADIANS should be ≈ sqrt(|eigenvalue|)
-            if eig > 0 and rad > 0:
-                expected_rad = eig**0.5
-                if abs(rad - expected_rad) / max(abs(rad), 1e-10) > 0.01:
-                    valid = False
-                    break
-            tmp_rows.append([mode, order, eig, rad, cyc, genm, gens])
-        if valid and tmp_rows:
-            rows = tmp_rows
-
-    # Fallback: stride=7 (two float32 words for eigenvalue, 28 bytes per row)
-    if not rows:
-        row_bytes_f32 = _STRIDE_F32 * 4
-        if n_bytes % row_bytes_f32 == 0 and n_bytes >= row_bytes_f32:
-            n_rows = n_bytes // row_bytes_f32
-            for i in range(n_rows):
-                off = i * row_bytes_f32
-                mode = struct.unpack_from(f"{bo}i", data, off)[0]
-                order = struct.unpack_from(f"{bo}i", data, off + 4)[0]
-                # eigenvalue stored as two consecutive float32 — take as float64 via reinterpret
-                eig_bytes = data[off + 8 : off + 16]
-                try:
-                    eig = struct.unpack_from(f"{bo}d", eig_bytes)[0]
-                except struct.error:
-                    eig = float("nan")
-                rad = struct.unpack_from(f"{bo}f", data, off + 16)[0]
-                cyc = struct.unpack_from(f"{bo}f", data, off + 20)[0]
-                genm = struct.unpack_from(f"{bo}f", data, off + 24)[0]
-                rows.append([mode, order, eig, rad, cyc, genm, float("nan")])
-
-    if not rows:
+    if n_bytes < row_bytes or n_bytes % row_bytes != 0:
         return pd.DataFrame(columns=_LAMA_COLS)
+
+    bo = ">" if endian == ">" else "<"
+    n_rows = n_bytes // row_bytes
+    rows: List[list] = []
+    for i in range(n_rows):
+        off = i * row_bytes
+        mode = struct.unpack_from(f"{bo}i", data, off)[0]
+        order = struct.unpack_from(f"{bo}i", data, off + 4)[0]
+        eig = struct.unpack_from(f"{bo}f", data, off + 8)[0]
+        rad = struct.unpack_from(f"{bo}f", data, off + 12)[0]
+        cyc = struct.unpack_from(f"{bo}f", data, off + 16)[0]
+        genm = struct.unpack_from(f"{bo}f", data, off + 20)[0]
+        gens = struct.unpack_from(f"{bo}f", data, off + 24)[0]
+        rows.append([mode, order, eig, rad, cyc, genm, gens])
 
     df = pd.DataFrame(rows, columns=_LAMA_COLS)
     df["MODE"] = df["MODE"].astype(int)
@@ -123,14 +124,25 @@ def _decode_lama_record(data: bytes, endian: str = "<") -> pd.DataFrame:
 def _subcase_for_lama_header(inv: OP2Inventory, header_idx: int) -> int:
     """
     Read the subcase ID from the IDENT record following a LAMA header.
-    Returns 1 if not determinable.
+
+    Tries the short 7-word IDENT (word[3] = subcase ID) and the longer
+    146-word IDENT (word[3] = subcase ID).  Returns 1 if not determinable.
     """
-    for i in range(header_idx + 1, min(len(inv.records), header_idx + 10)):
+    for i in range(header_idx + 1, min(len(inv.records), header_idx + 30)):
         rec = inv.records[i]
+        # Short IDENT: 7 words (28 bytes) — subcase at word[3]
         if rec.info.length == 28:
             try:
-                words = struct.unpack("<7i", rec.data)
-                sc = words[6]
+                words = struct.unpack(f"{inv.endian}7i", rec.data)
+                sc = words[3]
+                if sc > 0:
+                    return sc
+            except struct.error:
+                pass
+        # Long IDENT: >= 16 bytes — try word[3] as subcase
+        elif rec.info.length >= 16:
+            try:
+                sc = struct.unpack_from(f"{inv.endian}i", rec.data, 12)[0]
                 if sc > 0:
                     return sc
             except struct.error:
@@ -138,13 +150,19 @@ def _subcase_for_lama_header(inv: OP2Inventory, header_idx: int) -> int:
     return 1
 
 
-def _first_data_record_after(inv: OP2Inventory, header_idx: int) -> int:
-    """Return index of the first non-tiny record after header_idx."""
-    for i in range(header_idx + 1, min(len(inv.records), header_idx + 30)):
+def _find_lama_data_record(inv: OP2Inventory, header_idx: int) -> int:
+    """
+    Find the index of the eigenvalue data record after *header_idx*.
+
+    Scans forward from header_idx + 1, skipping tiny marker records and
+    IDENT/header blocks, until a record whose content passes
+    ``_is_lama_data()`` is found.  Returns -1 if not found.
+    """
+    for i in range(header_idx + 1, min(len(inv.records), header_idx + 40)):
         rec = inv.records[i]
-        if rec.info.length >= 28:
-            return i
-    return header_idx + 1
+        if rec.info.length >= 28 and _is_lama_data(rec.data, inv.endian):
+            return rec.info.index
+    return -1
 
 
 def decode_lama(inv: OP2Inventory) -> Dict[int, pd.DataFrame]:
@@ -163,9 +181,17 @@ def decode_lama(inv: OP2Inventory) -> Dict[int, pd.DataFrame]:
         return {}
 
     result: Dict[int, pd.DataFrame] = {}
+    seen_data_records: set = set()
+
     for hdr in headers:
+        data_idx = _find_lama_data_record(inv, hdr)
+        if data_idx < 0:
+            continue  # this LAMA occurrence has no data (summary header only)
+        if data_idx in seen_data_records:
+            continue  # same data record already decoded from an earlier header
+        seen_data_records.add(data_idx)
+
         sc = _subcase_for_lama_header(inv, hdr)
-        data_idx = _first_data_record_after(inv, hdr)
         rec = inv.records[data_idx]
         df = _decode_lama_record(rec.data, inv.endian)
         if df.empty:

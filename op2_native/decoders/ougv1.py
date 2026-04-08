@@ -7,22 +7,30 @@ import pandas as pd
 
 from ..models import OP2Inventory, OP2Record
 
-ROW_FMT = "<ii6f"  # dof_id, cp (or similar), then 6 DOFs
-ROW_SIZE = struct.calcsize(ROW_FMT)  # 32 bytes
-
-# numpy dtype matching the row layout (little-endian, 2 int32 + 6 float32)
-_ROW_DTYPE = np.dtype(
-    [
-        ("dof_id", "<i4"),
-        ("cp", "<i4"),
-        ("dx", "<f4"),
-        ("dy", "<f4"),
-        ("dz", "<f4"),
-        ("rx", "<f4"),
-        ("ry", "<f4"),
-        ("rz", "<f4"),
-    ]
+ROW_FMT = (
+    "ii6f"  # dof_id, cp (or similar), then 6 DOFs  (endian prefix added at runtime)
 )
+ROW_SIZE = 32  # 2 x int32 + 6 x float32
+
+
+def _row_dtype(endian: str = "<") -> np.dtype:
+    """Return the numpy dtype for one OUGV1 row with the given byte order."""
+    return np.dtype(
+        [
+            ("dof_id", f"{endian}i4"),
+            ("cp", f"{endian}i4"),
+            ("dx", f"{endian}f4"),
+            ("dy", f"{endian}f4"),
+            ("dz", f"{endian}f4"),
+            ("rx", f"{endian}f4"),
+            ("ry", f"{endian}f4"),
+            ("rz", f"{endian}f4"),
+        ]
+    )
+
+
+# Cached little-endian dtype for backwards compatibility
+_ROW_DTYPE = _row_dtype("<")
 
 OUT_COLS = ("GRID", "CP", "DX", "DY", "DZ", "RX", "RY", "RZ")
 
@@ -63,18 +71,20 @@ def classify_ougv1_headers(inv: OP2Inventory) -> List[tuple]:
                 continue
             if r.info.index >= next_boundary:
                 break
-            if _looks_like_ougv1_data(r):
+            if _looks_like_ougv1_data(r, inv.endian):
                 result.append((hdr_idx, r.info.index, sc_offset))
                 sc_offset += 1
     return result
 
 
-def _looks_like_ougv1_data(rec: OP2Record, min_good_rows: int = 5) -> bool:
+def _looks_like_ougv1_data(
+    rec: OP2Record, endian: str = "<", min_good_rows: int = 5
+) -> bool:
     L = rec.info.length
     if L < ROW_SIZE or (L % ROW_SIZE) != 0:
         return False
 
-    arr = np.frombuffer(rec.data[: min_good_rows * ROW_SIZE], dtype=_ROW_DTYPE)
+    arr = np.frombuffer(rec.data[: min_good_rows * ROW_SIZE], dtype=_row_dtype(endian))
     grids = arr["dof_id"] // 10
     cps = arr["cp"]
     if not (np.all(grids >= 1) & np.all(grids < 100_000_000)):
@@ -103,14 +113,16 @@ def decode_ougv1(
 ) -> pd.DataFrame:
     # ekey_idx is used here as the direct data record index (returned by
     # classify_ougv1_headers).  Fall back to forward scan when not provided.
-    data_idx = ekey_idx if ekey_idx is not None else find_ougv1_data_record(inv, header_index)
+    data_idx = (
+        ekey_idx if ekey_idx is not None else find_ougv1_data_record(inv, header_index)
+    )
     rec = next(r for r in inv.records if r.info.index == data_idx)
     data = rec.data
     L = rec.info.length
 
     # Trim to a whole number of rows then bulk-unpack with numpy
     n_rows = L // ROW_SIZE
-    arr = np.frombuffer(data[: n_rows * ROW_SIZE], dtype=_ROW_DTYPE)
+    arr = np.frombuffer(data[: n_rows * ROW_SIZE], dtype=_row_dtype(inv.endian))
 
     df = pd.DataFrame(
         {

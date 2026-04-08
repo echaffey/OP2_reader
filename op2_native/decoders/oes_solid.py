@@ -93,12 +93,12 @@ def _elem_type_from_ekey(inv: OP2Inventory, start_index: int) -> Optional[int]:
 
     rec = inv.records[start_index]
     if rec.info.length == 584:
-        words = struct.unpack("<146i", rec.data)
+        words = struct.unpack(f"{inv.endian}146i", rec.data)
         return _etype_from_ekey_words(words)
     for i in range(start_index + 1, min(len(inv.records), start_index + 30)):
         rec = inv.records[i]
         if rec.info.length == 584:
-            words = struct.unpack("<146i", rec.data)
+            words = struct.unpack(f"{inv.endian}146i", rec.data)
             return _etype_from_ekey_words(words)
     return None
 
@@ -251,13 +251,13 @@ def _decode_solid_payload_extended(
         for k in range(n_corners):
             cr_base = offset + 1 + centroid_wds + k * corner_wds
             grid = int(ints[cr_base])
-            sx  = float(floats[cr_base + 1])
+            sx = float(floats[cr_base + 1])
             sxy = float(floats[cr_base + 2])
-            sy  = float(floats[cr_base + 9])
+            sy = float(floats[cr_base + 9])
             syz = float(floats[cr_base + 10])
-            sz  = float(floats[cr_base + 15])
+            sz = float(floats[cr_base + 15])
             szx = float(floats[cr_base + 16])
-            vm  = float(floats[cr_base + 8])
+            vm = float(floats[cr_base + 8])
             if np.isfinite(sx) and np.isfinite(sy) and np.isfinite(sz):
                 rows.append([eid, grid, sx, sy, sz, sxy, syz, szx, vm])
 
@@ -284,7 +284,7 @@ def decode_oes_solid(
     numwde: Optional[int] = None
     rec = inv.records[ekey_or_hdr]
     if rec.info.length == 584:
-        words = struct.unpack("<146i", rec.data)
+        words = struct.unpack(f"{inv.endian}146i", rec.data)
         numwde = words[9]
 
     payload, data_idx, all_recs = load_data_bytes(inv, ekey_or_hdr)

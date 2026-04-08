@@ -8,12 +8,13 @@ from __future__ import annotations
 import struct
 import warnings
 from pathlib import Path
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, List, Optional, Union
 
+import numpy as np
 import pandas as pd
 
 from .fortran_io import FortranUnformattedReader
-from .models import OP2Inventory, OP2Record
+from .models import OP2Inventory, OP2Record, SubcaseMeta
 from .op2_reader import OP2Reader
 
 # decoder imports
@@ -22,6 +23,7 @@ from .decoders.oes_search import (
     find_oes_tables,
     find_oef_tables,
     classify_ostr_headers,
+    classify_ostr_el_headers,
     classify_oes_headers,
 )
 from .decoders.oes1x1_shell import decode_oes1x1_shell, decode_oes1x1_shell_corners
@@ -29,11 +31,24 @@ from .decoders.oes_solid import decode_oes_solid
 from .decoders.oes_bar import decode_oes_bar
 from .decoders.oes_cbush import decode_oes_cbush
 from .decoders.oef1 import decode_oef1, classify_oef_headers
-from .decoders.oqg1 import decode_oqg1, classify_oqg_headers
+from .decoders.oqg1 import (
+    decode_oqg1,
+    classify_oqg_headers,
+    classify_oqgcf1_headers,
+    classify_separation_headers,
+    decode_separation,
+)
 from .decoders.opg1 import decode_opg1, classify_opg_headers
 from .decoders.ostr1 import decode_ostr1
 from .decoders.ogpwg import decode_ogpwg
 from .decoders.lama import decode_lama
+from .decoders.oesnlxr import (
+    classify_oesnlxr_headers,
+    decode_oesnlxr_cbeam,
+    decode_oesnlxr_cbush,
+    decode_oesnlxr_ctetra,
+)
+from .decoders.geom_dat import parse_dat, GeomData
 
 
 class OP2:
@@ -44,21 +59,87 @@ class OP2:
     ----------
     path : str or Path
         Path to the .op2 file.
+    geometry : bool or str or Path, optional
+        Controls whether geometry (grid coordinates + element connectivity)
+        is loaded from the companion Nastran bulk-data file.
+
+        ``False`` (default)
+            No geometry is loaded.
+        ``True``
+            Auto-detect the companion ``.dat`` / ``.bdf`` file: looks for a
+            file with the same stem as *path* and extensions ``.dat``,
+            ``.bdf``, ``.nas`` (checked in that order).
+        str or Path
+            Explicit path to a ``.dat`` / ``.bdf`` file.
+
+        When geometry is available, use :meth:`grid_coordinates` and
+        :meth:`element_connectivity` to access the data.
 
     Examples
     --------
     >>> op2 = OP2("model.op2")
     >>> disp = op2.displacements()   # {subcase_id: DataFrame}
     >>> stress = op2.stresses()      # {subcase_id: DataFrame}
+
+    >>> op2 = OP2("model.op2", geometry=True)   # auto-find model.dat
+    >>> grids = op2.grid_coordinates()           # DataFrame(GID, X, Y, Z)
+    >>> conn  = op2.element_connectivity()       # {'CTETRA': df, ...}
     """
 
-    def __init__(self, path: str | Path) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        geometry: Union[bool, str, Path] = False,
+    ) -> None:
         self.path = Path(path)
         if not self.path.exists():
             raise FileNotFoundError(self.path)
         self._inv: Optional[OP2Inventory] = None
         # Result cache: keyed by method name so each decode runs at most once.
         self._cache: Dict[str, object] = {}
+        # Geometry: resolve the companion dat/bdf path (or None)
+        self._geom_path: Optional[Path] = self._resolve_geom_path(geometry)
+        self._geom: Optional[GeomData] = None  # lazy-loaded
+
+    # ------------------------------------------------------------------
+    # Geometry helpers
+    # ------------------------------------------------------------------
+
+    _GEOM_EXTENSIONS = (".dat", ".bdf", ".nas")
+
+    def _resolve_geom_path(self, geometry) -> Optional[Path]:
+        """Return the resolved bulk-data path, or None if geometry=False."""
+        if geometry is False or geometry is None:
+            return None
+        if geometry is True:
+            stem = self.path.stem
+            parent = self.path.parent
+            for ext in self._GEOM_EXTENSIONS:
+                candidate = parent / (stem + ext)
+                if candidate.exists():
+                    return candidate
+            warnings.warn(
+                f"geometry=True but no .dat/.bdf/.nas found alongside {self.path.name}."
+                " Set geometry=False or pass an explicit path.",
+                UserWarning,
+            )
+            return None
+        p = Path(geometry)
+        if not p.exists():
+            raise FileNotFoundError(f"Geometry file not found: {p}")
+        return p
+
+    @property
+    def _geometry(self) -> GeomData:
+        """Lazy-load and cache the parsed geometry."""
+        if self._geom_path is None:
+            raise RuntimeError(
+                "Geometry was not loaded for this OP2 instance.  "
+                "Re-open with geometry=True (or pass the .dat path)."
+            )
+        if self._geom is None:
+            self._geom = parse_dat(self._geom_path)
+        return self._geom
 
     def clear_cache(self) -> None:
         """Discard all cached results (e.g. after swapping the file)."""
@@ -101,10 +182,89 @@ class OP2:
         for i in range(header_index + 1, min(len(inv.records), header_index + 10)):
             rec = inv.records[i]
             if rec.info.length == 28:
-                words = struct.unpack("<7i", rec.data)
+                words = struct.unpack(f"{inv.endian}7i", rec.data)
                 isubcase = words[6]
                 return max(1, isubcase)
         return 1  # fallback
+
+    @staticmethod
+    def _decode_text_record(data: bytes) -> str:
+        """Decode a Nastran text record (Hollerith 4-byte words) to a stripped string."""
+        try:
+            return data.decode("latin-1", errors="replace").strip()
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _is_text_record(data: bytes, min_printable: float = 0.70) -> bool:
+        """Return True if *data* is mostly printable ASCII (space through ~)."""
+        if not data:
+            return False
+        printable = sum(0x20 <= b <= 0x7E for b in data)
+        return printable / len(data) >= min_printable
+
+    def _read_header_meta(self, inv: OP2Inventory, header_index: int) -> SubcaseMeta:
+        """
+        Extract ACODE, TCODE, ISUBCASE, and optional title/subtitle/label
+        strings from the records immediately following an 8-byte table-name
+        record.
+
+        OP2 header sequence (0-based from the table-name record):
+          +0  (8 bytes)  table name (padded with spaces)
+          +1  (4 bytes)  -1 marker
+          +2  (4 bytes)  7  (word count)
+          +3  (28 bytes) IDENT: [ACODE, TCODE, ?, ?, ?, LSDVMN, ISUBCASE]
+          +4  (4 bytes)  -1 marker
+          ...
+          subsequent records of 128 bytes each: TITLE, SUBTITLE, LABEL
+        """
+        table_name = ""
+        name_rec = inv.records[header_index]
+        if name_rec.info.length == 8:
+            table_name = name_rec.data.decode("latin-1", errors="replace").strip()
+
+        acode = 0
+        tcode = 0
+        isubcase = 1
+
+        # Parse the IDENT record
+        for i in range(header_index + 1, min(len(inv.records), header_index + 12)):
+            rec = inv.records[i]
+            if rec.info.length == 28:
+                try:
+                    words = struct.unpack(f"{inv.endian}7i", rec.data)
+                    acode = words[0]
+                    tcode = words[1]
+                    isubcase = max(1, words[6])
+                except struct.error:
+                    pass
+                break
+
+        # Scan for title / subtitle / label text records (128 bytes each)
+        # They appear within the first ~25 records after the table name.
+        text_records: List[str] = []
+        for i in range(header_index + 1, min(len(inv.records), header_index + 25)):
+            rec = inv.records[i]
+            if rec.info.length == 8:
+                break  # next table starts
+            if rec.info.length == 128 and self._is_text_record(rec.data):
+                text_records.append(self._decode_text_record(rec.data))
+            if len(text_records) == 3:
+                break
+
+        title = text_records[0] if len(text_records) > 0 else ""
+        subtitle = text_records[1] if len(text_records) > 1 else ""
+        label = text_records[2] if len(text_records) > 2 else ""
+
+        return SubcaseMeta(
+            subcase=isubcase,
+            acode=acode,
+            tcode=tcode,
+            table_name=table_name,
+            title=title,
+            subtitle=subtitle,
+            label=label,
+        )
 
     def _decode_all(
         self,
@@ -139,7 +299,11 @@ class OP2:
                 hdr, ekey_idx = item, None
             sc = self._read_subcase_id(inv, hdr) + sc_offset
             try:
-                df = decode_fn(inv, hdr) if ekey_idx is None else decode_fn(inv, hdr, ekey_idx)
+                df = (
+                    decode_fn(inv, hdr)
+                    if ekey_idx is None
+                    else decode_fn(inv, hdr, ekey_idx)
+                )
             except Exception as exc:
                 warnings.warn(f"{label} header rec {hdr}: {exc}", RuntimeWarning)
                 continue
@@ -262,8 +426,9 @@ class OP2:
         dict
             ``{subcase_id: DataFrame}``.
         """
+
         def _compute():
-            shells, bars, _bushes, _others = classify_oef_headers(self.inventory)
+            shells, bars, _bushes, _gaps, _others = classify_oef_headers(self.inventory)
             return self._decode_all(shells + bars, decode_oef1, "OEF1")
 
         return self._cached("element_forces", _compute)
@@ -278,11 +443,89 @@ class OP2:
             ``{subcase_id: DataFrame}`` with columns
             ``EID, FX, FY, FZ, MX, MY, MZ``.
         """
+
         def _compute():
-            _shells, _bars, bushes, _others = classify_oef_headers(self.inventory)
+            _shells, _bars, bushes, _gaps, _others = classify_oef_headers(
+                self.inventory
+            )
             return self._decode_all(bushes, decode_oef1, "OEF1-cbush")
 
         return self._cached("bush_forces", _compute)
+
+    def gap_forces(self) -> Dict[int, pd.DataFrame]:
+        """
+        Decode all OEF1 element force blocks for CGAP gap elements.
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns
+            ``EID, COMP_X, SHEAR_Y, SHEAR_Z, AXIAL_U, TOTAL_V, TOTAL_W, SLIP_V, SLIP_W``.
+        """
+
+        def _compute():
+            _shells, _bars, _bushes, gaps, _others = classify_oef_headers(
+                self.inventory
+            )
+            return self._decode_all(gaps, decode_oef1, "OEF1-cgap")
+
+        return self._cached("gap_forces", _compute)
+
+    def contact_forces(self) -> Dict[int, pd.DataFrame]:
+        """
+        Decode all OQGCF1 contact force blocks.
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns
+            ``GRID, FX, FY, FZ, MX, MY, MZ``.
+        """
+
+        def _compute():
+            return self._decode_all(
+                classify_oqgcf1_headers(self.inventory), decode_oqg1, "OQGCF1"
+            )
+
+        return self._cached("contact_forces", _compute)
+
+    def initial_separation(self) -> Dict[int, pd.DataFrame]:
+        """
+        Decode all OSPDSI1 initial contact separation distance blocks.
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns ``GRID, DISTANCE``.
+        """
+
+        def _compute():
+            return self._decode_all(
+                classify_separation_headers(self.inventory, "OSPDSI1"),
+                decode_separation,
+                "OSPDSI1",
+            )
+
+        return self._cached("initial_separation", _compute)
+
+    def deformed_separation(self) -> Dict[int, pd.DataFrame]:
+        """
+        Decode all OSPDS1 deformed contact separation distance blocks.
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns ``GRID, DISTANCE``.
+        """
+
+        def _compute():
+            return self._decode_all(
+                classify_separation_headers(self.inventory, "OSPDS1"),
+                decode_separation,
+                "OSPDS1",
+            )
+
+        return self._cached("deformed_separation", _compute)
 
     def spc_forces(self) -> Dict[int, pd.DataFrame]:
         """
@@ -336,6 +579,119 @@ class OP2:
             ),
         )
 
+    def bar_strains(self) -> Dict[int, pd.DataFrame]:
+        """
+        Decode all OSTR1 bar/beam strain blocks.
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns
+            ``EID, GRID, SD, SXC, SXD, SXE, SXF, SMAX, SMIN, MS_T, MS_C``.
+        """
+        return self._cached(
+            "bar_strains",
+            lambda: self._decode_all(
+                classify_ostr_headers(self.inventory)[2], decode_oes_bar, "OSTR1-bar"
+            ),
+        )
+
+    def solid_strains(self) -> Dict[int, pd.DataFrame]:
+        """
+        Decode all OSTR1 solid element strain blocks.
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns
+            ``EID, GRID, SX, SY, SZ, SXY, SYZ, SZX, VM``.
+        """
+        return self._cached(
+            "solid_strains",
+            lambda: self._decode_all(
+                classify_ostr_headers(self.inventory)[1],
+                decode_oes_solid,
+                "OSTR1-solid",
+            ),
+        )
+
+    def bush_strains(self) -> Dict[int, pd.DataFrame]:
+        """
+        Decode all OSTR1 bush element strain blocks.
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns
+            ``EID, EX, EY, EZ, ETX, ETY, ETZ``.
+        """
+        return self._cached(
+            "bush_strains",
+            lambda: self._decode_all(
+                classify_ostr_headers(self.inventory)[3], decode_oes_cbush, "OSTR1-bush"
+            ),
+        )
+
+    def bar_strains_el(self) -> Dict[int, pd.DataFrame]:
+        """
+        Decode all OSTR1EL bar/beam strain blocks (element coordinate system).
+
+        These are the same physical strains as :meth:`bar_strains` but expressed
+        in the element (local) coordinate system rather than the basic system.
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns
+            ``EID, GRID, SD, SXC, SXD, SXE, SXF, SMAX, SMIN, MS_T, MS_C``.
+        """
+        return self._cached(
+            "bar_strains_el",
+            lambda: self._decode_all(
+                classify_ostr_el_headers(self.inventory)[2],
+                decode_oes_bar,
+                "OSTR1EL-bar",
+            ),
+        )
+
+    def solid_strains_el(self) -> Dict[int, pd.DataFrame]:
+        """
+        Decode all OSTR1EL solid element strain blocks (element coordinate system).
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns
+            ``EID, GRID, SX, SY, SZ, SXY, SYZ, SZX, VM``.
+        """
+        return self._cached(
+            "solid_strains_el",
+            lambda: self._decode_all(
+                classify_ostr_el_headers(self.inventory)[1],
+                decode_oes_solid,
+                "OSTR1EL-solid",
+            ),
+        )
+
+    def bush_strains_el(self) -> Dict[int, pd.DataFrame]:
+        """
+        Decode all OSTR1EL bush element strain blocks (element coordinate system).
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns
+            ``EID, EX, EY, EZ, ETX, ETY, ETZ``.
+        """
+        return self._cached(
+            "bush_strains_el",
+            lambda: self._decode_all(
+                classify_ostr_el_headers(self.inventory)[3],
+                decode_oes_cbush,
+                "OSTR1EL-bush",
+            ),
+        )
+
     def grid_weight(self) -> Optional[dict]:
         """
         Decode the OGPWG (Grid Point Weight Generator) table.
@@ -377,6 +733,177 @@ class OP2:
             lambda: decode_lama(self.inventory),
         )
 
+    def metadata(self) -> Dict[int, SubcaseMeta]:
+        """
+        Extract case-control metadata from every result table header in the file.
+
+        Reads ACODE (analysis type), TCODE (table code), ISUBCASE, and the
+        TITLE / SUBTITLE / LABEL strings from each table's IDENT block.
+
+        When multiple tables share the same subcase ID (e.g. OES + OEF for the
+        same subcase), the *last* table's strings win for that subcase.  In
+        practice all tables in a subcase share the same case-control strings.
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: SubcaseMeta}``
+
+        Examples
+        --------
+        >>> op2 = OP2("model.op2")
+        >>> for sc, m in op2.metadata().items():
+        ...     print(sc, m.acode, m.title)
+        """
+
+        def _compute() -> Dict[int, SubcaseMeta]:
+            inv = self.inventory
+            # All 8-byte name records are table-header boundaries
+            headers = [r.info.index for r in inv.records if r.info.length == 8]
+            result: Dict[int, SubcaseMeta] = {}
+            for hdr in headers:
+                try:
+                    meta = self._read_header_meta(inv, hdr)
+                    # Only overwrite if we got a real acode (skip pure boundary markers)
+                    if meta.acode > 0 or meta.tcode > 0:
+                        result[meta.subcase] = meta
+                except Exception:
+                    pass
+            return result
+
+        return self._cached("metadata", _compute)
+
+    # ------------------------------------------------------------------
+    # Geometry (from companion .dat / .bdf file)
+    # ------------------------------------------------------------------
+
+    def grid_coordinates(self) -> pd.DataFrame:
+        """
+        Return grid-point coordinates parsed from the companion bulk-data file.
+
+        Requires the OP2 instance to have been opened with ``geometry=True``
+        (or an explicit path), e.g.::
+
+            op2 = OP2("model.op2", geometry=True)
+            grids = op2.grid_coordinates()
+
+        Returns
+        -------
+        pd.DataFrame
+            Columns: ``GID`` (int32), ``X`` (float64), ``Y`` (float64),
+            ``Z`` (float64), ``CP`` (int16, input coord system),
+            ``CD`` (int16, output coord system).  Sorted by ``GID``.
+
+        Raises
+        ------
+        RuntimeError
+            If geometry was not loaded (``geometry=False``).
+        """
+        return self._geometry.grids
+
+    def element_connectivity(
+        self, etype: Optional[str] = None
+    ) -> Union[Dict[str, pd.DataFrame], pd.DataFrame]:
+        """
+        Return element-to-node connectivity parsed from the companion bulk-data
+        file.
+
+        Requires the OP2 instance to have been opened with ``geometry=True``
+        (or an explicit path).
+
+        Parameters
+        ----------
+        etype : str, optional
+            Element type to return, e.g. ``'CTETRA'``, ``'CBEAM'``,
+            ``'CBUSH'``.  Case-insensitive.  If ``None`` (default), returns
+            a dict of all element types found.
+
+        Returns
+        -------
+        dict or pd.DataFrame
+            If *etype* is ``None``: ``{etype_str: DataFrame}`` for every
+            element type present in the bulk data.
+
+            If *etype* is given: the DataFrame for that element type.
+            Solid-element DataFrames have columns
+            ``EID, PID, G1, G2, G3, G4`` (CTETRA) etc.;
+            line-element DataFrames have ``EID, PID, GA, GB``.
+
+        Raises
+        ------
+        RuntimeError
+            If geometry was not loaded.
+        KeyError
+            If the requested *etype* is not present in the bulk data.
+        """
+        elems = self._geometry.elements
+        if etype is None:
+            return elems
+        key = etype.upper()
+        if key not in elems:
+            available = list(elems.keys())
+            raise KeyError(f"Element type {key!r} not found.  Available: {available}")
+        return elems[key]
+
+    def element_centroids(
+        self, etype: Optional[str] = None
+    ) -> Union[Dict[str, pd.DataFrame], pd.DataFrame]:
+        """
+        Compute element centroids (average of corner-node coordinates).
+
+        Requires geometry to have been loaded.
+
+        Parameters
+        ----------
+        etype : str, optional
+            Restrict to a single element type.  If ``None``, returns a dict
+            for every element type.
+
+        Returns
+        -------
+        dict or pd.DataFrame
+            DataFrame(s) with columns ``EID``, ``X``, ``Y``, ``Z``.
+        """
+        geom = self._geometry
+        grids = geom.grids.set_index("GID")[["X", "Y", "Z"]]
+
+        def _centroid_for(df: pd.DataFrame) -> pd.DataFrame:
+            node_cols = [c for c in df.columns if c not in ("EID", "PID")]
+            xyz_sum = np.zeros((len(df), 3))
+            n_valid = np.zeros(len(df), dtype=int)
+            for col in node_cols:
+                gids = df[col].values
+                mask = gids > 0
+                if not mask.any():
+                    continue
+                valid_gids = gids[mask]
+                present = np.isin(valid_gids, grids.index)
+                if not present.any():
+                    continue
+                xyz = grids.loc[valid_gids[present]].values
+                # Accumulate only for rows that have this node
+                row_idx = np.where(mask)[0][present]
+                xyz_sum[row_idx] += xyz
+                n_valid[row_idx] += 1
+            n_valid = np.maximum(n_valid, 1)
+            result = pd.DataFrame(
+                {
+                    "EID": df["EID"].values,
+                    "X": xyz_sum[:, 0] / n_valid,
+                    "Y": xyz_sum[:, 1] / n_valid,
+                    "Z": xyz_sum[:, 2] / n_valid,
+                }
+            )
+            return result
+
+        if etype is not None:
+            key = etype.upper()
+            if key not in geom.elements:
+                raise KeyError(f"Element type {key!r} not found.")
+            return _centroid_for(geom.elements[key])
+
+        return {et: _centroid_for(df) for et, df in geom.elements.items()}
+
     def stresses_with_corners(self) -> Dict[int, pd.DataFrame]:
         """
         Decode shell stresses including all four corner nodes.
@@ -400,6 +927,65 @@ class OP2:
                 "OES1X1-shell-corners",
             ),
         )
+
+    def nl_bar_stresses(self) -> Dict[int, pd.DataFrame]:
+        """
+        Decode all OESNLXR nonlinear **CBEAM** stress blocks.
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns
+            ``EID, GRID, FIBER, STRESS, EQ_STRESS, TOTAL_STRAIN,
+            EFF_STRAIN_PLAS, EFF_CREEP``.
+            One row per fiber (C/D/E/F) per station per element.
+        """
+
+        def _compute():
+            cbeam_blocks, _cbush, _ctetra = classify_oesnlxr_headers(self.inventory)
+            return self._decode_all(cbeam_blocks, decode_oesnlxr_cbeam, "OESNLXR-cbeam")
+
+        return self._cached("nl_bar_stresses", _compute)
+
+    def nl_bush_stresses(self) -> Dict[int, pd.DataFrame]:
+        """
+        Decode all OESNLXR nonlinear **CBUSH** force/stress/strain blocks.
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns
+            ``EID, FORCE_X, FORCE_Y, FORCE_Z, STRESS_TX, STRESS_TY, STRESS_TZ,
+            STRAIN_TX, STRAIN_TY, STRAIN_TZ, MOMENT_X, MOMENT_Y, MOMENT_Z,
+            STRESS_RX, STRESS_RY, STRESS_RZ, STRAIN_RX, STRAIN_RY, STRAIN_RZ``.
+        """
+
+        def _compute():
+            _cbeam, cbush_blocks, _ctetra = classify_oesnlxr_headers(self.inventory)
+            return self._decode_all(cbush_blocks, decode_oesnlxr_cbush, "OESNLXR-cbush")
+
+        return self._cached("nl_bush_stresses", _compute)
+
+    def nl_solid_stresses(self) -> Dict[int, pd.DataFrame]:
+        """
+        Decode all OESNLXR nonlinear **CTETRA** stress blocks.
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns
+            ``EID, GRID, SX, SY, SZ, SXY, SYZ, SZX, EQ_STRESS,
+            EFF_STRAIN_PLAS, EFF_CREEP, EX, EY, EZ, EXY, EYZ, EZX``.
+            ``GRID == 0`` rows are the element centroid.
+        """
+
+        def _compute():
+            _cbeam, _cbush, ctetra_blocks = classify_oesnlxr_headers(self.inventory)
+            return self._decode_all(
+                ctetra_blocks, decode_oesnlxr_ctetra, "OESNLXR-ctetra"
+            )
+
+        return self._cached("nl_solid_stresses", _compute)
 
     def results(self, subcase: int = 1) -> "Results":
         """
@@ -522,6 +1108,70 @@ class OP2:
         )
         return result_df
 
+    # Prefixes that identify result/output data-block tables.  All other
+    # tables (NX2412, PVT0, CASECC, EQEXIN, …) are metadata or admin blocks.
+    _RESULT_TABLE_PREFIXES = (
+        "OES",
+        "OUG",
+        "OUGV",
+        "OEF",
+        "OQG",
+        "OPG",
+        "OGP",
+        "OGS",
+        "OSTR",
+        "OGPWG",
+        "LAMA",
+        "OESNL",
+    )
+
+    def table_names(self, results_only: bool = True) -> List[str]:
+        """
+        Return the OP2 data-block (table) names present in the file,
+        in the order they appear.
+
+        Table names are read directly from the 8-byte header records that
+        Nastran writes at the start of every data block.  Duplicate entries
+        mean the same table appears more than once (one per subcase group).
+
+        Note: the list includes *all* OP2 tables by default, including
+        metadata/admin blocks such as ``NX2412`` (NX Nastran version header),
+        ``PVT0``/``PVT`` (private version data), ``CASECC`` (case control
+        echo), and ``EQEXIN`` (DOF mapping).  Pass ``results_only=True`` to
+        keep only tables that contain FEM result data.
+
+        Parameters
+        ----------
+        results_only : bool, optional
+            If ``True``, return only result/output tables (those whose names
+            begin with ``OES``, ``OUG``, ``OEF``, ``OQG``, ``OPG``,
+            ``OSTR``, ``OGPWG``, ``LAMA``, etc.).  Default ``True``.
+
+        Returns
+        -------
+        list of str
+            Table names in file order.
+
+        Examples
+        --------
+        >>> op2.table_names()
+        ['NX2412', 'PVT0', 'PVT', 'CASECC', 'CASECC1', 'EQEXINS',
+         'EQEXIN', 'OGPWG', 'OGPWG', 'OUGV1', 'OES1X1', 'OSTR1X']
+        >>> op2.table_names(results_only=True)
+        ['OGPWG', 'OGPWG', 'OUGV1', 'OES1X1', 'OSTR1X']
+        """
+        import re as _re
+
+        _NAME_RE = _re.compile(rb"^[A-Z0-9_]{2,8}[ ]{0,6}$")
+        names = [
+            r.data.decode("ascii", "replace").rstrip()
+            for r in self.inventory.records
+            if r.info.length == 8 and _NAME_RE.match(r.data)
+        ]
+        if results_only:
+            names = [n for n in names if n.startswith(self._RESULT_TABLE_PREFIXES)]
+        return names
+
     def describe(self) -> pd.DataFrame:
         """
         Return a statistical summary table for all non-empty result tables in
@@ -545,12 +1195,21 @@ class OP2:
             "displacements": self.displacements,
             "stresses": self.stresses,
             "strains": self.strains,
+            "bar_strains": self.bar_strains,
+            "bar_strains_el": self.bar_strains_el,
+            "solid_strains": self.solid_strains,
+            "solid_strains_el": self.solid_strains_el,
+            "bush_strains": self.bush_strains,
+            "bush_strains_el": self.bush_strains_el,
             "solid_stresses": self.solid_stresses,
             "bar_stresses": self.bar_stresses,
             "element_forces": self.element_forces,
             "spc_forces": self.spc_forces,
             "applied_loads": self.applied_loads,
             "eigenvalues": self.eigenvalues,
+            "nl_bar_stresses": self.nl_bar_stresses,
+            "nl_bush_stresses": self.nl_bush_stresses,
+            "nl_solid_stresses": self.nl_solid_stresses,
         }
         rows = []
         for name, method in result_methods.items():
@@ -602,9 +1261,18 @@ class OP2:
             "stresses": self.stresses(),
             "stresses_corners": self.stresses_with_corners(),
             "strains": self.strains(),
+            "bar_strains": self.bar_strains(),
+            "bar_strains_el": self.bar_strains_el(),
+            "solid_strains": self.solid_strains(),
+            "solid_strains_el": self.solid_strains_el(),
+            "bush_strains": self.bush_strains(),
+            "bush_strains_el": self.bush_strains_el(),
             "element_forces": self.element_forces(),
             "solid_stresses": self.solid_stresses(),
             "bar_stresses": self.bar_stresses(),
+            "nl_bar_stresses": self.nl_bar_stresses(),
+            "nl_bush_stresses": self.nl_bush_stresses(),
+            "nl_solid_stresses": self.nl_solid_stresses(),
         }
         out: Dict[str, pd.DataFrame] = {}
         for name, subcase_dict in sources.items():
@@ -683,11 +1351,20 @@ class OP2:
             "stresses": self.stresses(),
             "stresses_corners": self.stresses_with_corners(),
             "strains": self.strains(),
+            "bar_strains": self.bar_strains(),
+            "bar_strains_el": self.bar_strains_el(),
+            "solid_strains": self.solid_strains(),
+            "solid_strains_el": self.solid_strains_el(),
+            "bush_strains": self.bush_strains(),
+            "bush_strains_el": self.bush_strains_el(),
             "solid_stresses": self.solid_stresses(),
             "bar_stresses": self.bar_stresses(),
             "element_forces": self.element_forces(),
             "spc_forces": self.spc_forces(),
             "applied_loads": self.applied_loads(),
+            "nl_bar_stresses": self.nl_bar_stresses(),
+            "nl_bush_stresses": self.nl_bush_stresses(),
+            "nl_solid_stresses": self.nl_solid_stresses(),
             "eigenvalues": self.eigenvalues(),
         }
 
@@ -720,7 +1397,7 @@ class OP2:
         Return a summary of which result types are available for each subcase.
 
         Scans all decoded result tables and produces a cross-tabulation of
-        ``(subcase_id × result_type)`` showing the row count for each
+        ``(subcase_id x result_type)`` showing the row count for each
         combination that has data, and 0 otherwise.
 
         Returns
@@ -741,12 +1418,21 @@ class OP2:
             "stresses": self.stresses,
             "stresses_corners": self.stresses_with_corners,
             "strains": self.strains,
+            "bar_strains": self.bar_strains,
+            "bar_strains_el": self.bar_strains_el,
+            "solid_strains": self.solid_strains,
+            "solid_strains_el": self.solid_strains_el,
+            "bush_strains": self.bush_strains,
+            "bush_strains_el": self.bush_strains_el,
             "solid_stresses": self.solid_stresses,
             "bar_stresses": self.bar_stresses,
             "element_forces": self.element_forces,
             "spc_forces": self.spc_forces,
             "applied_loads": self.applied_loads,
             "eigenvalues": self.eigenvalues,
+            "nl_bar_stresses": self.nl_bar_stresses,
+            "nl_bush_stresses": self.nl_bush_stresses,
+            "nl_solid_stresses": self.nl_solid_stresses,
         }
         # Collect (subcase, result_name, n_rows) triples
         rows: list = []
@@ -796,7 +1482,6 @@ class OP2:
         # Pattern: [name(8)] ... [ctrl(4)]* [n_words(4)] [data(n_words*4)]
         for i, rec in enumerate(inv.records):
             if rec.ascii_hint.startswith("EQEXIN") and rec.info.length == 8:
-                import numpy as _np
                 for j in range(i + 1, min(i + 15, len(inv.records))):
                     jr = inv.records[j]
                     if jr.info.length != 4:
@@ -811,13 +1496,11 @@ class OP2:
                     kr = inv.records[k]
                     if kr.info.length != n_words * 4:
                         continue
-                    raw = _np.frombuffer(kr.data, dtype="<i4").reshape(-1, 2)
+                    raw = np.frombuffer(kr.data, dtype="<i4").reshape(-1, 2)
                     grids = raw[:, 0]
                     # Sanity: grid IDs should be small positive integers
                     if int(grids.min()) >= 1 and int(grids.max()) < 10_000_000:
-                        return pd.DataFrame(
-                            {"GRID": raw[:, 0], "EQTYPE": raw[:, 1]}
-                        )
+                        return pd.DataFrame({"GRID": raw[:, 0], "EQTYPE": raw[:, 1]})
         return pd.DataFrame(columns=["GRID", "EQTYPE"])
 
     def summary(self) -> pd.DataFrame:
@@ -926,6 +1609,15 @@ class Results:
         self.spc_forces = self._get(op2.spc_forces())
         self.applied_loads = self._get(op2.applied_loads())
         self.eigenvalues = self._get(op2.eigenvalues())
+        self.bar_strains = self._get(op2.bar_strains())
+        self.bar_strains_el = self._get(op2.bar_strains_el())
+        self.solid_strains = self._get(op2.solid_strains())
+        self.solid_strains_el = self._get(op2.solid_strains_el())
+        self.bush_strains = self._get(op2.bush_strains())
+        self.bush_strains_el = self._get(op2.bush_strains_el())
+        self.nl_bar_stresses = self._get(op2.nl_bar_stresses())
+        self.nl_bush_stresses = self._get(op2.nl_bush_stresses())
+        self.nl_solid_stresses = self._get(op2.nl_solid_stresses())
 
     def __repr__(self) -> str:
         parts = []
@@ -942,6 +1634,15 @@ class Results:
             "spc_forces",
             "applied_loads",
             "eigenvalues",
+            "bar_strains",
+            "bar_strains_el",
+            "solid_strains",
+            "solid_strains_el",
+            "bush_strains",
+            "bush_strains_el",
+            "nl_bar_stresses",
+            "nl_bush_stresses",
+            "nl_solid_stresses",
         ):
             df = getattr(self, attr)
             if not df.empty:

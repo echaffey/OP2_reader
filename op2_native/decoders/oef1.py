@@ -49,6 +49,17 @@ from .oes_peek import load_data_bytes, first_data_record_after_ekey
 _CQUAD4_FORCE_COLS = ["EID", "NX", "NY", "NXY", "MX", "MY", "MXY", "QX", "QY"]
 _CBAR_FORCE_COLS = ["EID", "BM1A", "BM2A", "BM1B", "BM2B", "TS1", "TS2", "AF", "TRQ"]
 _CBUSH_FORCE_COLS = ["EID", "FX", "FY", "FZ", "MX", "MY", "MZ"]
+_CGAP_FORCE_COLS = [
+    "EID",
+    "COMP_X",
+    "SHEAR_Y",
+    "SHEAR_Z",
+    "AXIAL_U",
+    "TOTAL_V",
+    "TOTAL_W",
+    "SLIP_V",
+    "SLIP_W",
+]
 _GENERIC_FORCE_COLS = ["EID", "LOC", "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8"]
 
 # CBEAM per-station force output (OEF1 NUMWDE=100, one row per active station)
@@ -63,6 +74,8 @@ _SHELL_ETYPES = {33, 73, 74, 144, 64, 75, 82, 70}
 _BAR_ETYPES = {2, 34, 100}
 # Bush/spring element types
 _BUSH_ETYPES = {102}  # CBUSH
+# Gap element types
+_GAP_ETYPES = {38}  # CGAP
 
 
 def _force_cols_for_etype(etype: Optional[int]) -> List[str]:
@@ -73,6 +86,8 @@ def _force_cols_for_etype(etype: Optional[int]) -> List[str]:
         return _CBAR_FORCE_COLS
     if etype in _BUSH_ETYPES:
         return _CBUSH_FORCE_COLS
+    if etype in _GAP_ETYPES:
+        return _CGAP_FORCE_COLS
     return _GENERIC_FORCE_COLS
 
 
@@ -83,14 +98,15 @@ def _etype_for_oef_header(inv: OP2Inventory, start_index: int) -> Optional[int]:
     otherwise the records following ``start_index`` are scanned.
     """
     from .oes_search import _etype_from_ekey_words
+
     rec = inv.records[start_index]
     if rec.info.length == 584:
-        words = struct.unpack("<146i", rec.data)
+        words = struct.unpack(f"{inv.endian}146i", rec.data)
         return _etype_from_ekey_words(words)
     for i in range(start_index + 1, min(len(inv.records), start_index + 30)):
         rec = inv.records[i]
         if rec.info.length == 584:
-            words = struct.unpack("<146i", rec.data)
+            words = struct.unpack(f"{inv.endian}146i", rec.data)
             return _etype_from_ekey_words(words)
     return None
 
@@ -101,14 +117,14 @@ def classify_oef_headers(inv: OP2Inventory):
 
     Returns
     -------
-    shell_blocks, bar_blocks, bush_blocks, other_blocks
+    shell_blocks, bar_blocks, bush_blocks, gap_blocks, other_blocks
         Each is a list of ``(header_idx, ekey_idx, sc_offset)`` 3-tuples.
     """
     from .oes_search import find_oef_tables, _find_ekeys_in_table
 
     tables = find_oef_tables(inv)
     all_hdrs = sorted(idx for hits in tables.values() for idx in hits)
-    shells, bars, bushes, others = [], [], [], []
+    shells, bars, bushes, gaps, others = [], [], [], [], []
     for hdr in all_hdrs:
         etype_count: dict = {}
         for ekey_idx, _first_data, etype, _numwde in _find_ekeys_in_table(inv, hdr):
@@ -121,9 +137,11 @@ def classify_oef_headers(inv: OP2Inventory):
                 bars.append(entry)
             elif etype in _BUSH_ETYPES:
                 bushes.append(entry)
+            elif etype in _GAP_ETYPES:
+                gaps.append(entry)
             else:
                 others.append(entry)
-    return shells, bars, bushes, others
+    return shells, bars, bushes, gaps, others
 
 
 # ---------------------------------------------------------------------------
@@ -401,7 +419,7 @@ def _decode_oef1_cbeam_payload(
             bm2 = float(floats[st_base + 3])
             ws1 = float(floats[st_base + 4])
             ws2 = float(floats[st_base + 5])
-            af  = float(floats[st_base + 6])
+            af = float(floats[st_base + 6])
             trq = float(floats[st_base + 7])
             # WARPING at st_base+8 is always zero for static analysis, skip
             rows.append([eid, grid, sd, bm1, bm2, ws1, ws2, af, trq])
@@ -409,12 +427,73 @@ def _decode_oef1_cbeam_payload(
     return pd.DataFrame(rows, columns=_CBEAM_FORCE_COLS)
 
 
+def _decode_oef1_cgap_payload(
+    payload: bytes,
+    endian: str = "<",
+    max_eid: int = 10_000_000,
+) -> pd.DataFrame:
+    """
+    Decode CGAP element forces/displacements: 9 words per element.
+
+    Word layout per element:
+      Word 0: packed_eid  (10 * EID + device_code)
+      Word 1: COMP_X   — axial compressive force (element X)
+      Word 2: SHEAR_Y  — shear force (element Y)
+      Word 3: SHEAR_Z  — shear force (element Z)
+      Word 4: AXIAL_U  — axial displacement (element X)
+      Word 5: TOTAL_V  — total displacement (element Y)
+      Word 6: TOTAL_W  — total displacement (element Z)
+      Word 7: SLIP_V   — slip displacement (element Y)
+      Word 8: SLIP_W   — slip displacement (element Z)
+
+    Column names match the Nastran F06 header:
+      EID, COMP_X, SHEAR_Y, SHEAR_Z, AXIAL_U, TOTAL_V, TOTAL_W, SLIP_V, SLIP_W
+    """
+    import numpy as np
+
+    n_words = len(payload) // 4
+    stride = 9
+    cols = _CGAP_FORCE_COLS
+    if n_words < stride:
+        return pd.DataFrame(columns=cols)
+
+    bo = "<" if endian == "<" else ">"
+    ints = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}i4")
+    floats = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}f4")
+
+    n_elem = n_words // stride
+    raw_ids = ints[::stride][:n_elem]
+    eids = raw_ids // 10
+    locs = raw_ids % 10
+    mask = (eids >= 1) & (eids <= max_eid) & (locs >= 1) & (locs <= 9)
+
+    rows_eid = eids[mask]
+    base = np.where(mask)[0] * stride
+
+    result = pd.DataFrame(
+        {
+            "EID": rows_eid.astype("int32"),
+            "COMP_X": floats[base + 1],
+            "SHEAR_Y": floats[base + 2],
+            "SHEAR_Z": floats[base + 3],
+            "AXIAL_U": floats[base + 4],
+            "TOTAL_V": floats[base + 5],
+            "TOTAL_W": floats[base + 6],
+            "SLIP_V": floats[base + 7],
+            "SLIP_W": floats[base + 8],
+        }
+    )
+    return result
+
+
 # ---------------------------------------------------------------------------
 # Public decoder
 # ---------------------------------------------------------------------------
 
 
-def decode_oef1(inv: OP2Inventory, header_index: int, ekey_index: int = None) -> pd.DataFrame:
+def decode_oef1(
+    inv: OP2Inventory, header_index: int, ekey_index: int = None
+) -> pd.DataFrame:
     """
     Decode an OEF1 element force block.
 
@@ -425,6 +504,8 @@ def decode_oef1(inv: OP2Inventory, header_index: int, ekey_index: int = None) ->
       ``EID, NX, NY, NXY, MX, MY, MXY, QX, QY``
     * CBAR/CBEAM bar elements:
       ``EID, BM1A, BM2A, BM1B, BM2B, TS1, TS2, AF, TRQ``
+    * CGAP gap elements:
+      ``EID, COMP_X, SHEAR_Y, SHEAR_Z, AXIAL_U, TOTAL_V, TOTAL_W, SLIP_V, SLIP_W``
     * Unknown element types:
       ``EID, LOC, F1 ... F8``
     """
@@ -445,7 +526,8 @@ def decode_oef1(inv: OP2Inventory, header_index: int, ekey_index: int = None) ->
         rec_e = inv.records[ekey_index]
         if rec_e.info.length == 584:
             import struct as _struct
-            numwde = _struct.unpack("<146i", rec_e.data)[9]
+
+            numwde = _struct.unpack(f"{inv.endian}146i", rec_e.data)[9]
 
     if etype in _SHELL_ETYPES:
         df = _decode_oef1_shell_payload(payload, endian=inv.endian)
@@ -458,6 +540,8 @@ def decode_oef1(inv: OP2Inventory, header_index: int, ekey_index: int = None) ->
             df = _decode_oef1_bar_payload(payload, endian=inv.endian)
     elif etype in _BUSH_ETYPES:
         df = _decode_oef1_bush_payload(payload, endian=inv.endian)
+    elif etype in _GAP_ETYPES:
+        df = _decode_oef1_cgap_payload(payload, endian=inv.endian)
     else:
         df = _decode_oef1_generic_payload(payload, endian=inv.endian)
 

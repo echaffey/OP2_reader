@@ -22,6 +22,7 @@ Quick-start
 """
 
 from .reader import OP2, Results
+from .models import SubcaseMeta
 from . import plots
 
-__all__ = ["OP2", "Results", "plots"]
+__all__ = ["OP2", "Results", "SubcaseMeta", "plots"]

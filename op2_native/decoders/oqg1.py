@@ -35,6 +35,7 @@ def classify_oqg_headers(inv: OP2Inventory) -> List[tuple]:
     """Return ``[(header_idx, data_rec_idx, sc_offset), ...]`` for all OQG1 data blocks."""
     return classify_grid_force_headers(inv, "OQG1")
 
+
 _COLS = ["GRID", "FX", "FY", "FZ", "MX", "MY", "MZ"]
 
 # numpy dtypes for the two possible row widths
@@ -85,8 +86,8 @@ def _decode_grid_force_payload(
     row_width = 7
     if n_bytes >= 32:
         # peek at cp word (offset 4) of first two rows assuming 8-word stride
-        cp0 = struct.unpack_from("<i", payload, 4)[0]
-        cp1 = struct.unpack_from("<i", payload, 36)[0] if n_bytes >= 64 else cp0
+        cp0 = struct.unpack_from(f"{endian}i", payload, 4)[0]
+        cp1 = struct.unpack_from(f"{endian}i", payload, 36)[0] if n_bytes >= 64 else cp0
         if 0 <= cp0 < 1000 and 0 <= cp1 < 1000 and (n_bytes % 32 == 0):
             row_width = 8
 
@@ -146,9 +147,122 @@ def decode_oqg1(
     -------
     DataFrame with columns ``GRID, FX, FY, FZ, MX, MY, MZ``.
     """
-    data_idx = ekey_idx if ekey_idx is not None else first_grid_force_record_after(inv, header_index)
+    data_idx = (
+        ekey_idx
+        if ekey_idx is not None
+        else first_grid_force_record_after(inv, header_index)
+    )
     rec = inv.records[data_idx]
     df = _decode_grid_force_payload(rec.data, endian=inv.endian)
+    df.attrs["header_record"] = header_index
+    df.attrs["data_record"] = data_idx
+    return df
+
+
+# ---------------------------------------------------------------------------
+# OQGCF1 — Contact forces (structurally identical to OQG1)
+# ---------------------------------------------------------------------------
+
+
+def classify_oqgcf1_headers(inv: OP2Inventory) -> List[tuple]:
+    """Return ``[(header_idx, data_rec_idx, sc_offset), ...]`` for OQGCF1 blocks."""
+    return classify_grid_force_headers(inv, "OQGCF1")
+
+
+# ---------------------------------------------------------------------------
+# OSPDSI1 / OSPDS1 — Contact separation distances (2 words per node)
+# ---------------------------------------------------------------------------
+
+_SEP_DTYPE_LE = np.dtype([("packed_id", "<i4"), ("distance", "<f4")])
+_SEP_DTYPE_BE = np.dtype([("packed_id", ">i4"), ("distance", ">f4")])
+
+_SEP_COLS = ["GRID", "DISTANCE"]
+
+
+def _record_looks_like_separation_data(
+    rec, endian: str = "<", min_rows: int = 5
+) -> bool:
+    """Heuristic: 2-word-per-node separation distance data records."""
+    import struct as _struct
+
+    L = rec.info.length
+    row_bytes = 8  # packed_grid_id(int32) + distance(float32)
+    if L < row_bytes * min_rows or L % row_bytes != 0:
+        return False
+    sample = min(L // row_bytes, 8)
+    for i in range(sample):
+        raw = _struct.unpack_from(f"{endian}i", rec.data, i * row_bytes)[0]
+        if raw <= 0:
+            return False
+        grid = raw // 10
+        if not (1 <= grid < 10_000_000):
+            return False
+    return True
+
+
+def classify_separation_headers(inv: OP2Inventory, token: str) -> List[tuple]:
+    """
+    Return ``[(header_idx, data_rec_idx, sc_offset), ...]`` for all
+    OSPDSI1 or OSPDS1 data blocks.
+    """
+    token_bytes = token.encode("ascii").ljust(8)
+    boundaries = sorted(r.info.index for r in inv.records if r.info.length == 8)
+
+    result: List[tuple] = []
+    for rec in inv.records:
+        if rec.info.length != 8 or rec.data[:8] != token_bytes:
+            continue
+        hdr_idx = rec.info.index
+        next_boundary = next(
+            (b for b in boundaries if b > hdr_idx), len(inv.records) + 1
+        )
+        sc_offset = 0
+        for r in inv.records:
+            if r.info.index <= hdr_idx:
+                continue
+            if r.info.index >= next_boundary:
+                break
+            if _record_looks_like_separation_data(r, inv.endian):
+                result.append((hdr_idx, r.info.index, sc_offset))
+                sc_offset += 1
+    return result
+
+
+def _decode_separation_payload(
+    payload: bytes,
+    endian: str = "<",
+    max_id: int = 100_000_000,
+) -> pd.DataFrame:
+    """Decode a 2-word-per-node separation distance payload."""
+    n_bytes = len(payload)
+    if n_bytes < 8:
+        return pd.DataFrame(columns=_SEP_COLS)
+    dtype = _SEP_DTYPE_LE if endian == "<" else _SEP_DTYPE_BE
+    n_rows = n_bytes // 8
+    arr = np.frombuffer(payload[: n_rows * 8], dtype=dtype)
+    grids = arr["packed_id"] // 10
+    mask = (grids >= 1) & (grids < max_id)
+    return pd.DataFrame(
+        {
+            "GRID": grids[mask].astype(np.int32),
+            "DISTANCE": arr["distance"][mask],
+        }
+    )
+
+
+def decode_separation(
+    inv: OP2Inventory, header_index: int, ekey_idx: int | None = None
+) -> pd.DataFrame:
+    """
+    Decode an OSPDSI1 or OSPDS1 contact separation distance block.
+
+    Returns
+    -------
+    DataFrame with columns ``GRID, DISTANCE``.
+    """
+    data_idx = ekey_idx if ekey_idx is not None else header_index + 1
+    rec = inv.records[data_idx]
+    df = _decode_separation_payload(rec.data, endian=inv.endian)
     df.attrs["header_record"] = header_index
     df.attrs["data_record"] = data_idx
     return df

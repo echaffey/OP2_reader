@@ -59,7 +59,7 @@ def _etype_for_header(inv: OP2Inventory, header_index: int) -> int:
     for i in range(header_index + 1, min(len(inv.records), header_index + 30)):
         rec = inv.records[i]
         if rec.info.length == 584:
-            words = struct.unpack("<146i", rec.data)
+            words = struct.unpack(f"{inv.endian}146i", rec.data)
             return _etype_from_ekey_words(words)
     return 0
 
@@ -81,11 +81,11 @@ def _find_ekeys_in_table(
     i = header_idx + 1
     while i < min(n, header_idx + 600):
         r = records[i]
-        if r.info.length == 8:          # next table header
+        if r.info.length == 8:  # next table header
             break
-        if r.info.length == 584:        # EKEY record
+        if r.info.length == 584:  # EKEY record
             ekey_i = i
-            words = struct.unpack("<146i", r.data)
+            words = struct.unpack(f"{inv.endian}146i", r.data)
             etype = _etype_from_ekey_words(words)
             numwde = words[9]
             if etype > 0 and numwde > 0:
@@ -93,7 +93,7 @@ def _find_ekeys_in_table(
                 first_data: int = -1
                 for j in range(ekey_i + 1, min(n, ekey_i + 20)):
                     rj = records[j]
-                    if rj.info.length == 8:   # next table
+                    if rj.info.length == 8:  # next table
                         break
                     if rj.info.length >= 1000:
                         first_data = j
@@ -146,7 +146,7 @@ def classify_oes_headers(
     all_hdrs = sorted(idx for hits in tables.values() for idx in hits)
     shells: List[Tuple[int, int, int]] = []
     solids: List[Tuple[int, int, int]] = []
-    bars:   List[Tuple[int, int, int]] = []
+    bars: List[Tuple[int, int, int]] = []
     bushes: List[Tuple[int, int, int]] = []
     for hdr in all_hdrs:
         # Track how many times each element type has appeared in this table
@@ -186,16 +186,59 @@ def find_ostr_tables(inv: OP2Inventory) -> Dict[str, List[int]]:
     """Return ``{token: [record_indices]}`` for OSTR1* (strain) headers.
 
     Each record is assigned to the *longest* matching token only.
+    ``OSTR1EL`` (element-CS strains) is intentionally excluded here; use
+    :func:`find_ostr_el_tables` for those.
     """
-    tokens = ["OSTR1X", "OSTR1C", "OSTR1"]  # longest first
+    # OSTR1EL must be claimed first so it is NOT caught by the shorter OSTR1 token.
+    tokens = ["OSTR1X", "OSTR1EL", "OSTR1C", "OSTR1"]  # longest first
     out: Dict[str, List[int]] = {}
     claimed: set = set()
     for tok in tokens:
         hits = [i for i in _find_token(inv, tok) if i not in claimed]
         if hits:
-            out[tok] = hits
             claimed.update(hits)
+            if tok != "OSTR1EL":  # keep EL out of the basic-CS result
+                out[tok] = hits
     return out
+
+
+def find_ostr_el_tables(inv: OP2Inventory) -> Dict[str, List[int]]:
+    """Return ``{token: [record_indices]}`` for ``OSTR1EL`` (element-CS strains)."""
+    hits = _find_token(inv, "OSTR1EL")
+    return {"OSTR1EL": hits} if hits else {}
+
+
+def classify_ostr_el_headers(
+    inv: OP2Inventory,
+) -> Tuple[List, List, List, List]:
+    """
+    Classify every ``OSTR1EL`` element-type sub-block by element category.
+
+    Identical logic to :func:`classify_ostr_headers` but applied to the
+    element-coordinate-system strain table ``OSTR1EL``.
+    Returns ``(shell_blocks, solid_blocks, bar_blocks, bush_blocks)``.
+    """
+    tables = find_ostr_el_tables(inv)
+    all_hdrs = sorted(idx for hits in tables.values() for idx in hits)
+    shells: List[Tuple[int, int, int]] = []
+    solids: List[Tuple[int, int, int]] = []
+    bars: List[Tuple[int, int, int]] = []
+    bushes: List[Tuple[int, int, int]] = []
+    for hdr in all_hdrs:
+        etype_count: dict = {}
+        for ekey_idx, _first_data, etype, _numwde in _find_ekeys_in_table(inv, hdr):
+            sc_offset = etype_count.get(etype, 0)
+            etype_count[etype] = sc_offset + 1
+            entry = (hdr, ekey_idx, sc_offset)
+            if etype in _SOLID_ETYPES:
+                solids.append(entry)
+            elif etype in _BAR_ETYPES:
+                bars.append(entry)
+            elif etype in _BUSH_ETYPES:
+                bushes.append(entry)
+            else:
+                shells.append(entry)
+    return shells, solids, bars, bushes
 
 
 def classify_ostr_headers(
@@ -213,7 +256,7 @@ def classify_ostr_headers(
     all_hdrs = sorted(idx for hits in tables.values() for idx in hits)
     shells: List[Tuple[int, int, int]] = []
     solids: List[Tuple[int, int, int]] = []
-    bars:   List[Tuple[int, int, int]] = []
+    bars: List[Tuple[int, int, int]] = []
     bushes: List[Tuple[int, int, int]] = []
     for hdr in all_hdrs:
         etype_count: dict = {}

@@ -78,7 +78,7 @@ def _record_looks_like_header(rec) -> bool:
     return False
 
 
-def _record_looks_like_stress_data(rec) -> bool:
+def _record_looks_like_stress_data(rec, endian: str = "<") -> bool:
     """
     Heuristic: stress data records are:
       - reasonably large, and
@@ -95,7 +95,7 @@ def _record_looks_like_stress_data(rec) -> bool:
     for i in range(0, len(head), 4):
         if i + 4 > len(head):
             break
-        floats.append(struct.unpack("<f", head[i : i + 4])[0])
+        floats.append(struct.unpack(f"{endian}f", head[i : i + 4])[0])
 
     if not floats:
         return False
@@ -125,7 +125,7 @@ def first_stress_record_after(
         rec = inv.records[i]
         if _record_looks_like_header(rec):
             continue
-        if _record_looks_like_stress_data(rec):
+        if _record_looks_like_stress_data(rec, inv.endian):
             return i
     raise ValueError(f"No stress-like record found after header {header_index}")
 
@@ -250,7 +250,7 @@ def load_data_bytes(
 
 
 def _record_looks_like_grid_force_data(
-    rec, row_widths=(8, 7), min_rows: int = 10
+    rec, endian: str = "<", row_widths=(8, 7), min_rows: int = 10
 ) -> bool:
     """
     Heuristic for OQG1/OPG1-style records where forces may be all zero.
@@ -276,7 +276,9 @@ def _record_looks_like_grid_force_data(
         ids = []
         ok = True
         for r in range(sample):
-            raw = struct.unpack("<i", rec.data[r * row_bytes : r * row_bytes + 4])[0]
+            raw = struct.unpack(
+                f"{endian}i", rec.data[r * row_bytes : r * row_bytes + 4]
+            )[0]
             if raw <= 0:
                 ok = False
                 break
@@ -309,7 +311,7 @@ def first_grid_force_record_after(
         rec = inv.records[i]
         if rec.info.length < 28:  # smaller than one 7-word row
             continue
-        if _record_looks_like_grid_force_data(rec):
+        if _record_looks_like_grid_force_data(rec, inv.endian):
             return i
     raise ValueError(f"No grid-force-like record found after header {header_index}")
 
@@ -340,7 +342,7 @@ def classify_grid_force_headers(inv: OP2Inventory, token: str) -> List[tuple]:
                 continue
             if r.info.index >= next_boundary:
                 break
-            if _record_looks_like_grid_force_data(r):
+            if _record_looks_like_grid_force_data(r, inv.endian):
                 result.append((hdr_idx, r.info.index, sc_offset))
                 sc_offset += 1
     return result

@@ -97,7 +97,9 @@ def decode_ogpwg(inv: OP2Inventory) -> Optional[Dict]:
     if n_words < _OGPWG_WORDS:
         return None
 
-    floats = list(struct.unpack(f"<{_OGPWG_WORDS}f", data[: _OGPWG_WORDS * 4]))
+    floats = list(
+        struct.unpack(f"{inv.endian}{_OGPWG_WORDS}f", data[: _OGPWG_WORDS * 4])
+    )
 
     # S: 6x6 matrix (words 0-35)
     S_flat = floats[0:36]

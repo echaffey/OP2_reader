@@ -103,14 +103,15 @@ def _elem_type_from_ekey(inv: OP2Inventory, start_index: int) -> Optional[int]:
     otherwise the records following ``start_index`` are scanned.
     """
     from .oes_search import _etype_from_ekey_words
+
     rec = inv.records[start_index]
     if rec.info.length == 584:
-        words = struct.unpack("<146i", rec.data)
+        words = struct.unpack(f"{inv.endian}146i", rec.data)
         return _etype_from_ekey_words(words)
     for i in range(start_index + 1, min(len(inv.records), start_index + 30)):
         rec = inv.records[i]
         if rec.info.length == 584:
-            words = struct.unpack("<146i", rec.data)
+            words = struct.unpack(f"{inv.endian}146i", rec.data)
             return _etype_from_ekey_words(words)
     return None
 
@@ -200,7 +201,9 @@ def _decode_cbeam_payload(
     return pd.DataFrame(rows, columns=_CBEAM_COLS)
 
 
-def decode_oes_bar(inv: OP2Inventory, header_index: int, ekey_index: int = None) -> pd.DataFrame:
+def decode_oes_bar(
+    inv: OP2Inventory, header_index: int, ekey_index: int = None
+) -> pd.DataFrame:
     """
     Decode a bar/beam element stress block from OES1X1.
 

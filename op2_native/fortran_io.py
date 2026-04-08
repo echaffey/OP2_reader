@@ -46,11 +46,14 @@ class FortranUnformattedReader:
     def _try_probe(self, endian: str, marker_size: int) -> Optional[int]:
         """Return first record length if trailer matches; else None. Keeps file position at 0."""
         self.fp.seek(0, io.SEEK_SET)
-        len_fmt = endian + ("I" if marker_size == 4 else "Q")
+        # 8-byte markers: some runtimes write a signed int64; strip the high
+        # continuation bit (0x80000000_00000000) used by gfortran subrecords.
+        len_fmt = endian + ("I" if marker_size == 4 else "q")
         head = self.fp.read(marker_size)
         if len(head) != marker_size:
             return None
-        (nbytes,) = struct.unpack(len_fmt, head)
+        (raw,) = struct.unpack(len_fmt, head)
+        nbytes = int(raw) & 0x7FFF_FFFF_FFFF_FFFF if marker_size == 8 else int(raw)
         # nbytes must be positive and "reasonable" (avoid gigabytes at rec #0)
         if nbytes <= 0 or nbytes > (1 << 30):
             return None
@@ -59,7 +62,8 @@ class FortranUnformattedReader:
         tail = self.fp.read(marker_size)
         if len(tail) != marker_size:
             return None
-        (nbytes2,) = struct.unpack(len_fmt, tail)
+        (raw2,) = struct.unpack(len_fmt, tail)
+        nbytes2 = int(raw2) & 0x7FFF_FFFF_FFFF_FFFF if marker_size == 8 else int(raw2)
         if nbytes != nbytes2:
             return None
         return nbytes
@@ -84,7 +88,8 @@ class FortranUnformattedReader:
     def __iter__(self) -> Iterator[Tuple[RecordInfo, bytes]]:
         """Iterate all records as (RecordInfo, payload_bytes)."""
         self.detect()
-        length_fmt = self.endian + ("I" if self.marker_size == 4 else "Q")
+        length_fmt = self.endian + ("I" if self.marker_size == 4 else "q")
+        _8byte = self.marker_size == 8
         rec_index = 0
         while True:
             offset = self.fp.tell()
@@ -93,7 +98,8 @@ class FortranUnformattedReader:
                 break  # EOF
             if len(head) != self.marker_size:
                 raise IOError(f"Truncated marker at offset {offset}")
-            (nbytes,) = struct.unpack(length_fmt, head)
+            (raw,) = struct.unpack(length_fmt, head)
+            nbytes = (int(raw) & 0x7FFF_FFFF_FFFF_FFFF) if _8byte else int(raw)
             payload = self.fp.read(nbytes)
             if len(payload) != nbytes:
                 raise IOError(
@@ -102,7 +108,8 @@ class FortranUnformattedReader:
             tail = self.fp.read(self.marker_size)
             if len(tail) != self.marker_size:
                 raise IOError(f"Missing trailer at record {rec_index}, offset {offset}")
-            (nbytes2,) = struct.unpack(length_fmt, tail)
+            (raw2,) = struct.unpack(length_fmt, tail)
+            nbytes2 = (int(raw2) & 0x7FFF_FFFF_FFFF_FFFF) if _8byte else int(raw2)
             if nbytes != nbytes2:
                 raise IOError(
                     f"Marker mismatch at record {rec_index}, offset {offset}: {nbytes} != {nbytes2}"
