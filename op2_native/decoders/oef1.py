@@ -68,6 +68,31 @@ _CBEAM_OEF_NUM_WIDE = 100  # 1 packed_eid + 11 stations × 9 words/station
 _CBEAM_OEF_STATIONS = 11
 _CBEAM_OEF_WORDS_PER_STATION = 9
 
+# CQUAD4 corner-force columns (EID=element, GRID=0 for centroid, >0 for corner)
+# Force layout per row: NX, NY, NXY, MX, MY, MXY, QX, QY  (8 floats)
+_CQUAD4_FORCE_CORNER_COLS = [
+    "EID", "GRID",
+    "NX", "NY", "NXY", "MX", "MY", "MXY", "QX", "QY",
+]
+
+# CQUAD4 corner layout constants (NUMWDE=47):
+#   w0        : packed_eid  (10*EID + device_code)
+#   w1        : 'CEN/' ASCII marker
+#   w2        : n_corners (=4)
+#   w3..w10   : 8 centroid force floats
+#   w11       : packed corner-1 grid id  (10*GRID + device)
+#   w12..w19  : 8 corner-1 force floats
+#   w20..w28  : packed corner-2 id + 8 floats
+#   w29..w37  : packed corner-3 id + 8 floats
+#   w38..w46  : packed corner-4 id + 8 floats
+#   Total: 3 + 8 + 4*9 = 47  ✓
+_CQUAD4_CORNER_NUMWDE = 47
+_CQUAD4_CORNER_CEN_OFFSET = 3   # centroid forces start at word 3
+_CQUAD4_CORNER_CEN_WORDS = 8    # 8 force floats per layer (NX..QY)
+_CQUAD4_CORNER_STRIDE = 9       # 1 packed grid id + 8 forces per corner
+_CQUAD4_N_CORNERS = 4
+CEN_MARKER_UINT = 793658691     # b'CEN/' as little-endian uint32
+
 # Shell element types
 _SHELL_ETYPES = {33, 73, 74, 144, 64, 75, 82, 70}
 # Bar/beam element types
@@ -220,6 +245,125 @@ def _decode_oef1_shell_payload(
                     forces = floats[offset + 3 : offset + 11]
                     if np.all(np.isfinite(forces)):
                         rows.append([eid] + forces.tolist())
+
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _decode_oef1_ctria3_payload(
+    payload: bytes,
+    endian: str = "<",
+    max_eid: int = 1_000_000,
+) -> pd.DataFrame:
+    """
+    Decode CTRIA3 element forces (NUMWDE=9, centroid only, EID-first layout).
+
+    Word layout per element (9 words):
+        w0:     packed_eid  (10*EID + device_code)
+        w1..w8: NX, NY, NXY, MX, MY, MXY, QX, QY
+    """
+    import numpy as np
+
+    n_words = len(payload) // 4
+    cols = _CQUAD4_FORCE_COLS  # same 9 columns: EID, NX..QY
+    if n_words < 9:
+        return pd.DataFrame(columns=cols)
+
+    bo = "<" if endian == "<" else ">"
+    floats = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}f4")
+    words_i = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}i4")
+
+    stride = 9
+    rows = []
+    for offset in range(0, n_words - stride + 1, stride):
+        raw_id = int(words_i[offset])
+        if raw_id < 10:
+            continue
+        eid = raw_id // 10
+        if not (1 <= eid <= max_eid):
+            continue
+        forces = floats[offset + 1 : offset + 9]
+        if not np.all(np.isfinite(forces)):
+            continue
+        rows.append([eid] + forces.tolist())
+
+    return pd.DataFrame(rows, columns=cols)
+
+
+def _decode_oef1_shell_corner_payload(
+    payload: bytes,
+    endian: str = "<",
+    max_eid: int = 1_000_000,
+    max_grid: int = 10_000_000,
+) -> pd.DataFrame:
+    """
+    Decode CQUAD4 element forces with corner output (NUMWDE=47).
+
+    Layout per element (47 words):
+      w0        : packed_eid  (10*EID + device_code)
+      w1        : 'CEN/' ASCII marker  (0x434E452F)
+      w2        : n_corners  (= 4)
+      w3..w10   : centroid forces (8 floats: NX, NY, NXY, MX, MY, MXY, QX, QY)
+      w11       : packed corner-1 grid id (10*GRID + device)
+      w12..w19  : corner-1 forces
+      w20..w46  : (corner-2, corner-3, corner-4) same pattern
+
+    Returns a DataFrame with one row per (EID, location) pair.
+    GRID=0 for the centroid row; GRID=actual grid ID for corner rows.
+    """
+    import numpy as np
+
+    n_words = len(payload) // 4
+    cols = _CQUAD4_FORCE_CORNER_COLS
+    stride = _CQUAD4_CORNER_NUMWDE
+
+    if n_words < stride:
+        return pd.DataFrame(columns=cols)
+
+    bo = "<" if endian == "<" else ">"
+    floats = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}f4")
+    uints = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}u4")
+    ints = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}i4")
+
+    rows: List[list] = []
+    i = 0
+    while i + stride <= n_words:
+        raw_eid = int(uints[i])
+        # Validate: packed as 10*EID + loc, loc in 1..9, EID in range
+        if not (raw_eid >= 10 and 1 <= (raw_eid % 10) <= 9 and raw_eid // 10 <= max_eid):
+            i += 1
+            continue
+        # Must be followed by CEN/ marker
+        if int(uints[i + 1]) != CEN_MARKER_UINT:
+            i += 1
+            continue
+
+        eid = raw_eid // 10
+        # Centroid forces: words i+3 .. i+10
+        cen_f = floats[i + _CQUAD4_CORNER_CEN_OFFSET :
+                        i + _CQUAD4_CORNER_CEN_OFFSET + _CQUAD4_CORNER_CEN_WORDS].tolist()
+        rows.append([eid, 0] + cen_f)
+
+        # Corner rows
+        corner_base = i + _CQUAD4_CORNER_CEN_OFFSET + _CQUAD4_CORNER_CEN_WORDS
+        for _ in range(_CQUAD4_N_CORNERS):
+            if corner_base + _CQUAD4_CORNER_STRIDE > n_words:
+                break
+            raw_grid = int(uints[corner_base])
+            # Packed as 10*GRID + device; for small GRIDs (<=9) the raw value
+            # may equal GRID directly (device_code=0 or stored without packing).
+            if raw_grid >= 10:
+                grid_id = raw_grid // 10
+            elif raw_grid > 0:
+                grid_id = raw_grid  # raw grid ID stored without packing
+            else:
+                break
+            if not (0 < grid_id <= max_grid):
+                break
+            cf = floats[corner_base + 1 : corner_base + _CQUAD4_CORNER_STRIDE].tolist()
+            rows.append([eid, grid_id] + cf)
+            corner_base += _CQUAD4_CORNER_STRIDE
+
+        i += stride
 
     return pd.DataFrame(rows, columns=cols)
 
@@ -500,8 +644,11 @@ def decode_oef1(
     The element type is read from the EKEY record to select the correct
     column names:
 
-    * CQUAD4/CTRIA3 shell elements:
+    * CQUAD4/CTRIA3 shell (centroid only, NUMWDE=11 or 9):
       ``EID, NX, NY, NXY, MX, MY, MXY, QX, QY``
+    * CQUAD4 shell with corner output (NUMWDE=47):
+      ``EID, GRID, NX, NY, NXY, MX, MY, MXY, QX, QY``
+      (GRID=0 for centroid, actual grid ID for corner rows)
     * CBAR/CBEAM bar elements:
       ``EID, BM1A, BM2A, BM1B, BM2B, TS1, TS2, AF, TRQ``
     * CGAP gap elements:
@@ -512,25 +659,37 @@ def decode_oef1(
     etype = _etype_for_oef_header(
         inv, ekey_index if ekey_index is not None else header_index
     )
-    if ekey_index is not None:
-        first_idx = first_data_record_after_ekey(inv, ekey_index)
-        payload, data_idx, _all_recs = load_data_bytes(
-            inv, ekey_index, first_idx=first_idx
-        )
-    else:
-        payload, data_idx, _all_recs = load_data_bytes(inv, header_index)
 
-    # Determine NUMWDE to choose the correct per-element stride
+    # Determine NUMWDE early so we can set the correct minimum data record size.
+    # Small element counts (e.g. 2 CTRIA3 elements) produce data records that are
+    # only numwde*4 bytes each — well below the default 1000-byte threshold.
     numwde = None
     if ekey_index is not None:
         rec_e = inv.records[ekey_index]
         if rec_e.info.length == 584:
             import struct as _struct
-
             numwde = _struct.unpack(f"{inv.endian}146i", rec_e.data)[9]
 
+    min_db = numwde * 4 if numwde else 1000
+
+    if ekey_index is not None:
+        first_idx = first_data_record_after_ekey(inv, ekey_index, min_data_bytes=min_db)
+        payload, data_idx, _all_recs = load_data_bytes(
+            inv, ekey_index, first_idx=first_idx, min_data_bytes=min_db
+        )
+    else:
+        payload, data_idx, _all_recs = load_data_bytes(inv, header_index, min_data_bytes=min_db)
+
     if etype in _SHELL_ETYPES:
-        df = _decode_oef1_shell_payload(payload, endian=inv.endian)
+        if numwde == _CQUAD4_CORNER_NUMWDE:
+            # CQUAD4/CQUADR with corner output
+            df = _decode_oef1_shell_corner_payload(payload, endian=inv.endian)
+        elif numwde == 9:
+            # CTRIA3 centroid-only (EID-first, 9 words/element)
+            df = _decode_oef1_ctria3_payload(payload, endian=inv.endian)
+        else:
+            # Centroid-only CQUAD4 (NUMWDE=11)
+            df = _decode_oef1_shell_payload(payload, endian=inv.endian)
     elif etype in _BAR_ETYPES:
         # CBEAM uses a per-station layout (NUMWDE=100) identical in spirit to the
         # OES stress layout.  CBAR uses the simpler 9-word/element layout.
@@ -549,4 +708,6 @@ def decode_oef1(
     df.attrs["data_record"] = data_idx
     df.attrs["all_data_records"] = _all_recs
     df.attrs["element_type"] = etype
+    df.attrs["numwde"] = numwde
     return df
+

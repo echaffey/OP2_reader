@@ -89,13 +89,16 @@ def _find_ekeys_in_table(
             etype = _etype_from_ekey_words(words)
             numwde = words[9]
             if etype > 0 and numwde > 0:
-                # Look for a data block within the next 20 records
+                # Look for a data block within the next 20 records.
+                # Use numwde*4 as the minimum data size (1 element worth of bytes)
+                # so small tables (e.g. 2 CTRIA3 elements = 72 bytes) are not missed.
+                min_data_bytes = numwde * 4
                 first_data: int = -1
                 for j in range(ekey_i + 1, min(n, ekey_i + 20)):
                     rj = records[j]
                     if rj.info.length == 8:  # next table
                         break
-                    if rj.info.length >= 1000:
+                    if rj.info.length >= min_data_bytes:
                         first_data = j
                         break
                 if first_data >= 0:

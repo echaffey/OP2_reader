@@ -312,6 +312,51 @@ def _decode_oes1x1_by_alignment(
     return df
 
 
+def decode_oes1x1_tria3_payload(
+    payload: bytes,
+    endian: str = "<",
+    max_eid: int = 1_000_000,
+) -> pd.DataFrame:
+    """
+    Decode OES1X1 CTRIA3 stress blocks (NUMWDE=17, centroid only).
+
+    Word layout per element (17 words):
+        w0:      packed_eid  (10*EID + device_code)
+        w1..w16: FD1,SX1,SY1,TXY1,ANG1,MAJOR1,MINOR1,VM1,
+                 FD2,SX2,SY2,TXY2,ANG2,MAJOR2,MINOR2,VM2
+
+    EID is at the START of each record (unlike CQUAD4 centroid-only format
+    where it is at the end).
+    """
+    import numpy as np
+
+    n_words = len(payload) // 4
+    if n_words < 17:
+        return pd.DataFrame(columns=SHELL_STRESS_COLS)
+
+    bo = "<" if endian == "<" else ">"
+    floats = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}f4")
+    words_i = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}i4")
+
+    stride = 17
+    rows = []
+    for offset in range(0, n_words - stride + 1, stride):
+        raw_id = int(words_i[offset])
+        if raw_id < 10:
+            continue
+        eid = raw_id // 10
+        if not (1 <= eid <= max_eid):
+            continue
+        stresses = floats[offset + 1 : offset + 17]
+        if not np.all(np.isfinite(stresses)):
+            continue
+        rows.append([eid] + stresses.tolist())
+
+    df = pd.DataFrame(rows, columns=SHELL_STRESS_COLS)
+    df.attrs["decoded_elems"] = len(df)
+    return df
+
+
 def decode_oes1x1_by_marker(
     payload: bytes, endian: str = "<", float_thr: float = 1e-6, max_eid: int = 1_000_000
 ) -> pd.DataFrame:
@@ -490,7 +535,14 @@ def decode_oes1x1_shell_corners(
             if corner_start + _CORNER_STRIDE > n_words:
                 break
             raw_grid = uints[corner_start]
-            grid_id = raw_grid // 10  # packed as 10*GRID + device_code
+            # Packed as 10*GRID + device; for small GRIDs (<=9) the raw value
+            # may equal GRID directly (device_code=0 or stored without packing).
+            if raw_grid >= 10:
+                grid_id = raw_grid // 10
+            elif raw_grid > 0:
+                grid_id = raw_grid  # raw grid ID stored without packing
+            else:
+                break
             if not (0 < grid_id <= max_grid):
                 break
             c_s = _read_floats(corner_start + 1, 16)

@@ -26,7 +26,7 @@ from .decoders.oes_search import (
     classify_ostr_el_headers,
     classify_oes_headers,
 )
-from .decoders.oes1x1_shell import decode_oes1x1_shell, decode_oes1x1_shell_corners
+from .decoders.oes1x1_shell import decode_oes1x1_shell, decode_oes1x1_shell_corners, decode_oes1x1_tria3_payload
 from .decoders.oes_solid import decode_oes_solid
 from .decoders.oes_bar import decode_oes_bar
 from .decoders.oes_cbush import decode_oes_cbush
@@ -344,21 +344,63 @@ class OP2:
         """
         Decode all OES1X1 **shell** stress blocks.
 
+        When the OP2 was written with ``STRESS(CORNER)`` the decoder
+        automatically uses the corner-aware path (NUMWDE=87 for CQUAD4);
+        centroid-only output (NUMWDE=17–19) and CTRIA3 single-layer
+        output are also handled.
+
         Returns
         -------
         dict
-            ``{subcase_id: DataFrame}`` with columns
+            ``{subcase_id: DataFrame}``.
+
+            *Centroid-only output* columns:
             ``EID, FD1, SX1, SY1, TXY1, ANG1, MAJOR1, MINOR1, VM1,
             FD2, SX2, SY2, TXY2, ANG2, MAJOR2, MINOR2, VM2``.
+
+            *Corner output* adds a ``GRID`` column (``GRID=0`` for the
+            centroid row, actual grid ID for each corner row).
         """
-        return self._cached(
-            "stresses",
-            lambda: self._decode_all(
-                classify_oes_headers(self.inventory)[0],
-                decode_oes1x1_shell,
-                "OES1X1-shell",
-            ),
-        )
+        def _compute():
+            import struct as _struct
+            inv = self.inventory
+            shell_blocks = classify_oes_headers(inv)[0]
+            result: Dict[int, pd.DataFrame] = {}
+            for item in shell_blocks:
+                hdr, ekey_idx, sc_offset = item
+                sc = self._read_subcase_id(inv, hdr) + sc_offset
+                # Read NUMWDE from the EKEY record to choose the decoder
+                numwde = None
+                if ekey_idx is not None:
+                    rec_e = inv.records[ekey_idx]
+                    if rec_e.info.length == 584:
+                        numwde = _struct.unpack(f"{inv.endian}146i", rec_e.data)[9]
+                try:
+                    if numwde == 87:
+                        df = decode_oes1x1_shell_corners(inv, hdr, ekey_idx)
+                    elif numwde == 17:
+                        from .decoders.oes_peek import load_data_bytes
+                        payload, data_idx, _all_recs = load_data_bytes(
+                            inv, ekey_idx if ekey_idx is not None else hdr
+                        )
+                        df = decode_oes1x1_tria3_payload(payload, endian=inv.endian)
+                        df.attrs["header_record"] = hdr
+                        df.attrs["data_record"] = data_idx
+                        df.attrs["all_data_records"] = _all_recs
+                    else:
+                        df = decode_oes1x1_shell(inv, hdr, ekey_idx)
+                except Exception as exc:
+                    import warnings as _w
+                    _w.warn(f"OES1X1-shell header rec {hdr}: {exc}", RuntimeWarning)
+                    continue
+                if sc in result:
+                    result[sc] = pd.concat([result[sc], df], ignore_index=True)
+                else:
+                    result[sc] = df
+            return result
+
+        return self._cached("stresses", _compute)
+
 
     def solid_stresses(self) -> Dict[int, pd.DataFrame]:
         """
@@ -420,6 +462,11 @@ class OP2:
     def element_forces(self) -> Dict[int, pd.DataFrame]:
         """
         Decode all OEF1 element force blocks for shell and bar/beam elements.
+
+        When the OP2 was written with ``FORCE(CORNER)`` the result includes
+        corner rows per element (``GRID`` column: 0=centroid, >0=corner grid ID).
+        Centroid-only output and mixed models with both CQUAD4 and CTRIA3
+        are handled automatically via the ``NUMWDE`` field.
 
         Returns
         -------
