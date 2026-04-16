@@ -16,7 +16,7 @@ plot_displacement_magnitude(df, subcase=1, component="mag", title=None)
 plot_element_forces(df, component="NX", title=None)
     Bar chart of a chosen element force component per element.
 
-plot_stress_histogram(df, column="VM1", bins=40, title=None)
+plot_stress_histogram(df, column="VON_MISES1", bins=40, title=None)
     Histogram of a stress/strain column across all elements.
 """
 from __future__ import annotations
@@ -66,12 +66,12 @@ def plot_vm_stress(
     ----------
     df : DataFrame
         Output of ``op2.stresses()[subcase]``.
-        Must contain ``EID`` and at least one of ``VM1``, ``VM2``.
+        Must contain ``EID`` and at least one of ``VON_MISES1``, ``VON_MISES2``.
     fiber : {"max", "1", "2"}
         Which fiber layer to plot:
-        * ``"max"`` — element-wise maximum of VM1 and VM2
-        * ``"1"``   — bottom fiber (VM1)
-        * ``"2"``   — top fiber (VM2)
+        * ``"max"`` — element-wise maximum of VON_MISES1 and VON_MISES2
+        * ``"1"``   — bottom fiber (VON_MISES1)
+        * ``"2"``   — top fiber (VON_MISES2)
     title : str, optional
     color_scale : str
         Plotly color scale name (default ``"Plasma"``).
@@ -85,19 +85,21 @@ def plot_vm_stress(
     _require_plotly()
     go = _go()
 
-    if "VM1" not in df.columns and "VM2" not in df.columns:
-        raise ValueError("DataFrame has no VM1/VM2 columns — is this a stress table?")
+    if "VON_MISES1" not in df.columns and "VON_MISES2" not in df.columns:
+        raise ValueError(
+            "DataFrame has no VON_MISES1/VON_MISES2 columns — is this a stress table?"
+        )
 
     df = df.copy()
     if fiber == "max":
-        cols = [c for c in ("VM1", "VM2") if c in df.columns]
+        cols = [c for c in ("VON_MISES1", "VON_MISES2") if c in df.columns]
         df["_vm"] = df[cols].max(axis=1)
         y_label = "VM stress (max fiber)"
     elif fiber == "1":
-        df["_vm"] = df["VM1"]
+        df["_vm"] = df["VON_MISES1"]
         y_label = "VM stress (fiber 1, bottom)"
     else:
-        df["_vm"] = df["VM2"]
+        df["_vm"] = df["VON_MISES2"]
         y_label = "VM stress (fiber 2, top)"
 
     df = df.sort_values("EID").reset_index(drop=True)
@@ -144,9 +146,9 @@ def plot_displacement_magnitude(
     ----------
     df : DataFrame
         Output of ``op2.displacements()[subcase]``.
-        Must contain ``GRID`` and ``DX, DY, DZ``.
-    component : {"mag", "DX", "DY", "DZ", "RX", "RY", "RZ"}
-        ``"mag"`` computes sqrt(DX²+DY²+DZ²); any other value selects that
+        Must contain ``GRID`` and ``TX, TY, TZ``.
+    component : {"mag", "TX", "TY", "TZ", "RX", "RY", "RZ"}
+        ``"mag"`` computes sqrt(TX²+TY²+TZ²); any other value selects that
         column directly.
     title : str, optional
     color_scale : str
@@ -162,7 +164,7 @@ def plot_displacement_magnitude(
     _require_plotly()
     go = _go()
 
-    required = {"GRID", "DX", "DY", "DZ"}
+    required = {"GRID", "TX", "TY", "TZ"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"DataFrame is missing columns: {missing}")
@@ -170,7 +172,7 @@ def plot_displacement_magnitude(
     df = df.copy().sort_values("GRID").reset_index(drop=True)
 
     if component == "mag":
-        df["_val"] = np.sqrt(df["DX"] ** 2 + df["DY"] ** 2 + df["DZ"] ** 2)
+        df["_val"] = np.sqrt(df["TX"] ** 2 + df["TY"] ** 2 + df["TZ"] ** 2)
         y_label = "|U| displacement magnitude"
     else:
         if component not in df.columns:
@@ -275,7 +277,7 @@ def plot_element_forces(
 
 def plot_stress_histogram(
     df: pd.DataFrame,
-    column: str = "VM1",
+    column: str = "VON_MISES1",
     bins: int = 40,
     title: Optional[str] = None,
     height: int = 450,
@@ -288,7 +290,7 @@ def plot_stress_histogram(
     df : DataFrame
         Output of ``op2.stresses()[subcase]`` or similar.
     column : str
-        Column to histogram. Defaults to ``"VM1"``.
+        Column to histogram. Defaults to ``"VON_MISES1"``.
     bins : int
         Number of histogram bins.
     title : str, optional
@@ -357,7 +359,7 @@ def plot_top_n_stress(
     ----------
     df : DataFrame
         Output of ``op2.stresses()[subcase]``.  Must contain ``EID`` and at
-        least one of ``VM1``, ``VM2``.
+        least one of ``VON_MISES1``, ``VON_MISES2``.
     n : int
         Number of top elements to display.  Default 20.
     fiber : {"max", "1", "2"}
@@ -373,19 +375,21 @@ def plot_top_n_stress(
     _require_plotly()
     go = _go()
 
-    if "VM1" not in df.columns and "VM2" not in df.columns:
-        raise ValueError("DataFrame has no VM1/VM2 columns — is this a stress table?")
+    if "VON_MISES1" not in df.columns and "VON_MISES2" not in df.columns:
+        raise ValueError(
+            "DataFrame has no VON_MISES1/VON_MISES2 columns — is this a stress table?"
+        )
 
     df = df.copy()
     if fiber == "max":
-        cols = [c for c in ("VM1", "VM2") if c in df.columns]
+        cols = [c for c in ("VON_MISES1", "VON_MISES2") if c in df.columns]
         df["_vm"] = df[cols].max(axis=1)
         y_label = "VM stress (max fiber)"
     elif fiber == "1":
-        df["_vm"] = df["VM1"]
+        df["_vm"] = df["VON_MISES1"]
         y_label = "VM stress (fiber 1)"
     else:
-        df["_vm"] = df["VM2"]
+        df["_vm"] = df["VON_MISES2"]
         y_label = "VM stress (fiber 2)"
 
     top = (
@@ -437,7 +441,7 @@ def plot_principal_stress(
     ----------
     df : DataFrame
         Output of ``op2.stresses()[subcase]``.  Must contain
-        ``EID, MAJOR1, MINOR1, VM1`` (or ``…2`` for fiber 2).
+        ``EID, MAX_PRIN1, MIN_PRIN1, VON_MISES1`` (or ``…2`` for fiber 2).
     fiber : {"1", "2"}
         Which fiber to plot.
     title : str, optional
@@ -454,7 +458,7 @@ def plot_principal_stress(
     go = _go()
 
     suf = fiber  # "1" or "2"
-    needed = {f"EID", f"MAJOR{suf}", f"MINOR{suf}", f"VM{suf}"}
+    needed = {"EID", f"MAX_PRIN{suf}", f"MIN_PRIN{suf}", f"VON_MISES{suf}"}
     missing = needed - set(df.columns)
     if missing:
         raise ValueError(f"DataFrame is missing columns: {missing}")
@@ -462,13 +466,13 @@ def plot_principal_stress(
     df = df.copy().sort_values("EID").reset_index(drop=True)
 
     # Downsample: keep the highest-VM elements if there are too many
-    vm_col = f"VM{suf}"
+    vm_col = f"VON_MISES{suf}"
     if len(df) > max_elements:
         df = df.nlargest(max_elements, vm_col).sort_values("EID").reset_index(drop=True)
 
     eids = df["EID"].astype(str)
-    major = df[f"MAJOR{suf}"]
-    minor = df[f"MINOR{suf}"]
+    major = df[f"MAX_PRIN{suf}"]
+    minor = df[f"MIN_PRIN{suf}"]
     vm = df[vm_col]
 
     fig = go.Figure()

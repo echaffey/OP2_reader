@@ -5,7 +5,7 @@ from typing import List, Optional
 import re
 
 from .fortran_io import FortranUnformattedReader, RecordInfo
-from .models import OP2Record, OP2Inventory
+from .models import OP2Record, OP2Inventory, _HEAD_BYTES
 
 ASCII_HINT_RE = re.compile(rb"[A-Z0-9_]{3,12}")
 
@@ -64,10 +64,14 @@ class OP2Reader:
             for info, data in reader:
                 ascii_hint = self._ascii_hint(data)
                 name = self._probable_table(data)
+                # Truncate large payloads — only keep the head bytes needed for
+                # heuristics and headers.  Full data is fetched on demand via
+                # OP2Inventory.get_record_data().
+                stored = data if len(data) <= _HEAD_BYTES else data[:_HEAD_BYTES]
                 recs.append(
                     OP2Record(
                         info=info,
-                        data=data,
+                        data=stored,
                         ascii_hint=ascii_hint,
                         probable_table_name=name,
                     )

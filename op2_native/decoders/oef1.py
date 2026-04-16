@@ -71,8 +71,16 @@ _CBEAM_OEF_WORDS_PER_STATION = 9
 # CQUAD4 corner-force columns (EID=element, GRID=0 for centroid, >0 for corner)
 # Force layout per row: NX, NY, NXY, MX, MY, MXY, QX, QY  (8 floats)
 _CQUAD4_FORCE_CORNER_COLS = [
-    "EID", "GRID",
-    "NX", "NY", "NXY", "MX", "MY", "MXY", "QX", "QY",
+    "EID",
+    "GRID",
+    "NX",
+    "NY",
+    "NXY",
+    "MX",
+    "MY",
+    "MXY",
+    "QX",
+    "QY",
 ]
 
 # CQUAD4 corner layout constants (NUMWDE=47):
@@ -80,18 +88,18 @@ _CQUAD4_FORCE_CORNER_COLS = [
 #   w1        : 'CEN/' ASCII marker
 #   w2        : n_corners (=4)
 #   w3..w10   : 8 centroid force floats
-#   w11       : packed corner-1 grid id  (10*GRID + device)
+#   w11       : corner-1 grid id (plain integer, NOT packed)
 #   w12..w19  : 8 corner-1 force floats
 #   w20..w28  : packed corner-2 id + 8 floats
 #   w29..w37  : packed corner-3 id + 8 floats
 #   w38..w46  : packed corner-4 id + 8 floats
 #   Total: 3 + 8 + 4*9 = 47  ✓
 _CQUAD4_CORNER_NUMWDE = 47
-_CQUAD4_CORNER_CEN_OFFSET = 3   # centroid forces start at word 3
-_CQUAD4_CORNER_CEN_WORDS = 8    # 8 force floats per layer (NX..QY)
-_CQUAD4_CORNER_STRIDE = 9       # 1 packed grid id + 8 forces per corner
+_CQUAD4_CORNER_CEN_OFFSET = 3  # centroid forces start at word 3
+_CQUAD4_CORNER_CEN_WORDS = 8  # 8 force floats per layer (NX..QY)
+_CQUAD4_CORNER_STRIDE = 9  # 1 grid id + 8 forces per corner
 _CQUAD4_N_CORNERS = 4
-CEN_MARKER_UINT = 793658691     # b'CEN/' as little-endian uint32
+CEN_MARKER_UINT = 793658691  # b'CEN/' as little-endian uint32
 
 # Shell element types
 _SHELL_ETYPES = {33, 73, 74, 144, 64, 75, 82, 70}
@@ -303,7 +311,7 @@ def _decode_oef1_shell_corner_payload(
       w1        : 'CEN/' ASCII marker  (0x434E452F)
       w2        : n_corners  (= 4)
       w3..w10   : centroid forces (8 floats: NX, NY, NXY, MX, MY, MXY, QX, QY)
-      w11       : packed corner-1 grid id (10*GRID + device)
+      w11       : corner-1 grid id (plain integer, NOT packed)
       w12..w19  : corner-1 forces
       w20..w46  : (corner-2, corner-3, corner-4) same pattern
 
@@ -329,7 +337,9 @@ def _decode_oef1_shell_corner_payload(
     while i + stride <= n_words:
         raw_eid = int(uints[i])
         # Validate: packed as 10*EID + loc, loc in 1..9, EID in range
-        if not (raw_eid >= 10 and 1 <= (raw_eid % 10) <= 9 and raw_eid // 10 <= max_eid):
+        if not (
+            raw_eid >= 10 and 1 <= (raw_eid % 10) <= 9 and raw_eid // 10 <= max_eid
+        ):
             i += 1
             continue
         # Must be followed by CEN/ marker
@@ -339,8 +349,12 @@ def _decode_oef1_shell_corner_payload(
 
         eid = raw_eid // 10
         # Centroid forces: words i+3 .. i+10
-        cen_f = floats[i + _CQUAD4_CORNER_CEN_OFFSET :
-                        i + _CQUAD4_CORNER_CEN_OFFSET + _CQUAD4_CORNER_CEN_WORDS].tolist()
+        cen_f = floats[
+            i
+            + _CQUAD4_CORNER_CEN_OFFSET : i
+            + _CQUAD4_CORNER_CEN_OFFSET
+            + _CQUAD4_CORNER_CEN_WORDS
+        ].tolist()
         rows.append([eid, 0] + cen_f)
 
         # Corner rows
@@ -349,14 +363,11 @@ def _decode_oef1_shell_corner_payload(
             if corner_base + _CQUAD4_CORNER_STRIDE > n_words:
                 break
             raw_grid = int(uints[corner_base])
-            # Packed as 10*GRID + device; for small GRIDs (<=9) the raw value
-            # may equal GRID directly (device_code=0 or stored without packing).
-            if raw_grid >= 10:
-                grid_id = raw_grid // 10
-            elif raw_grid > 0:
-                grid_id = raw_grid  # raw grid ID stored without packing
-            else:
+            # Corner GRID IDs are stored as plain integers (not packed with
+            # device code the way element IDs are).
+            if raw_grid == 0:
                 break
+            grid_id = raw_grid
             if not (0 < grid_id <= max_grid):
                 break
             cf = floats[corner_base + 1 : corner_base + _CQUAD4_CORNER_STRIDE].tolist()
@@ -668,6 +679,7 @@ def decode_oef1(
         rec_e = inv.records[ekey_index]
         if rec_e.info.length == 584:
             import struct as _struct
+
             numwde = _struct.unpack(f"{inv.endian}146i", rec_e.data)[9]
 
     min_db = numwde * 4 if numwde else 1000
@@ -678,7 +690,9 @@ def decode_oef1(
             inv, ekey_index, first_idx=first_idx, min_data_bytes=min_db
         )
     else:
-        payload, data_idx, _all_recs = load_data_bytes(inv, header_index, min_data_bytes=min_db)
+        payload, data_idx, _all_recs = load_data_bytes(
+            inv, header_index, min_data_bytes=min_db
+        )
 
     if etype in _SHELL_ETYPES:
         if numwde == _CQUAD4_CORNER_NUMWDE:
@@ -710,4 +724,3 @@ def decode_oef1(
     df.attrs["element_type"] = etype
     df.attrs["numwde"] = numwde
     return df
-

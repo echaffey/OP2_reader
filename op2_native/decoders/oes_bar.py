@@ -8,20 +8,20 @@ Nastran OP2 real SORT1 CBAR stress layout  (num_wide = 16)
 Each element occupies exactly 16 words:
 
     Word  0 : packed_eid_device  (10*EID + device_code)
-    Word  1 : S1A   float  bending stress, end A, pt 1
-    Word  2 : S2A   float  bending stress, end A, pt 2
-    Word  3 : S3A   float  bending stress, end A, pt 3
-    Word  4 : S4A   float  bending stress, end A, pt 4
-    Word  5 : AXIAL float  axial stress
-    Word  6 : SMAXA float  max stress at end A
-    Word  7 : SMINA float  min stress at end A
-    Word  8 : MS_A  float  margin of safety, tension, end A
-    Word  9 : S1B   float  bending stress, end B, pt 1
-    Word 10 : S2B   float  bending stress, end B, pt 2
-    Word 11 : S3B   float  bending stress, end B, pt 3
-    Word 12 : S4B   float  bending stress, end B, pt 4
-    Word 13 : SMAXB float  max stress at end B
-    Word 14 : SMINB float  min stress at end B
+    Word  1 : BEND1A  float  bending stress, end A, pt 1
+    Word  2 : BEND2A  float  bending stress, end A, pt 2
+    Word  3 : BEND3A  float  bending stress, end A, pt 3
+    Word  4 : BEND4A  float  bending stress, end A, pt 4
+    Word  5 : AXIAL   float  axial stress
+    Word  6 : SMAX_A  float  max stress at end A
+    Word  7 : SMIN_A  float  min stress at end A
+    Word  8 : MS_A    float  margin of safety, tension, end A
+    Word  9 : BEND1B  float  bending stress, end B, pt 1
+    Word 10 : BEND2B  float  bending stress, end B, pt 2
+    Word 11 : BEND3B  float  bending stress, end B, pt 3
+    Word 12 : BEND4B  float  bending stress, end B, pt 4
+    Word 13 : SMAX_B  float  max stress at end B
+    Word 14 : SMIN_B  float  min stress at end B
     Word 15 : MS_C  float  margin of safety, compression, end B
 
 Nastran OP2 real SORT1 CBEAM stress layout  (num_wide = 111)
@@ -35,8 +35,8 @@ Each 10-word station row:
 
 Output columns (CBAR)
 ---------------------
-  EID, S1A, S2A, S3A, S4A, AXIAL,
-  SMAXA, SMINA, MS_A, S1B, S2B, S3B, S4B, SMAXB, SMINB, MS_C
+  EID, BEND1A, BEND2A, BEND3A, BEND4A, AXIAL,
+  SMAX_A, SMIN_A, MS_A, BEND1B, BEND2B, BEND3B, BEND4B, SMAX_B, SMIN_B, MS_C
 
 Output columns (CBEAM -- one row per station per element)
 ---------------------------------------------------------
@@ -63,20 +63,20 @@ _CBEAM_NUM_WIDE = 111  # 1 packed_eid + 11 stations x 10 words
 
 _CBAR_COLS = [
     "EID",
-    "S1A",
-    "S2A",
-    "S3A",
-    "S4A",
+    "BEND1A",
+    "BEND2A",
+    "BEND3A",
+    "BEND4A",
     "AXIAL",
-    "SMAXA",
-    "SMINA",
+    "SMAX_A",
+    "SMIN_A",
     "MS_A",
-    "S1B",
-    "S2B",
-    "S3B",
-    "S4B",
-    "SMAXB",
-    "SMINB",
+    "BEND1B",
+    "BEND2B",
+    "BEND3B",
+    "BEND4B",
+    "SMAX_B",
+    "SMIN_B",
     "MS_C",
 ]
 

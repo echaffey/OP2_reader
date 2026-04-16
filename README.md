@@ -63,7 +63,7 @@ All methods cache on first call; use `op2.clear_cache()` to force a re-read.
 
 | Method | Columns | Description |
 |--------|---------|-------------|
-| `displacements()` | `GRID, CP, DX, DY, DZ, RX, RY, RZ` | OUGV1 translations & rotations |
+| `displacements()` | `GRID, TX, TY, TZ, RX, RY, RZ` | OUGV1 translations & rotations |
 | `spc_forces()` | `GRID, FX, FY, FZ, MX, MY, MZ` | OQG1 single-point constraint forces |
 | `applied_loads()` | `GRID, FX, FY, FZ, MX, MY, MZ` | OPG1 applied load vector |
 | `grid_weight()` | — | OGPWG mass/CG/inertia (returns a dict, not a dict-of-DataFrames) |
@@ -72,7 +72,7 @@ All methods cache on first call; use `op2.clear_cache()` to force a re-read.
 
 | Method | Key columns | Description |
 |--------|-------------|-------------|
-| `stresses()` | `EID, FD1, SX1, SY1, TXY1, ANG1, MAJOR1, MINOR1, VM1, …FD2…` | OES1X1 centroid stresses (2 fibers) |
+| `stresses()` | `EID, FD1, SX1, SY1, TXY1, ANG1, MAX_PRIN1, MIN_PRIN1, VON_MISES1, …FD2…` | OES1X1 centroid stresses (2 fibers) |
 | `stresses_with_corners()` | same + corner-node rows | Shell stresses at element corners |
 | `strains()` | similar to stresses | OSTR1 shell strains |
 | `element_forces()` | element-type dependent | OEF1 shell + beam forces |
@@ -162,7 +162,7 @@ from op2_native import plots
 fig = plots.plot_vm_stress(op2.stresses()[1])
 fig = plots.plot_displacement_magnitude(op2.displacements()[1])
 fig = plots.plot_element_forces(op2.element_forces()[1], component="BM1")
-fig = plots.plot_stress_histogram(op2.stresses()[1], column="VM1")
+fig = plots.plot_stress_histogram(op2.stresses()[1], column="VON_MISES1")
 fig.show()
 ```
 

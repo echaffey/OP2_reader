@@ -26,7 +26,11 @@ from .decoders.oes_search import (
     classify_ostr_el_headers,
     classify_oes_headers,
 )
-from .decoders.oes1x1_shell import decode_oes1x1_shell, decode_oes1x1_shell_corners, decode_oes1x1_tria3_payload
+from .decoders.oes1x1_shell import (
+    decode_oes1x1_shell,
+    decode_oes1x1_shell_corners,
+    decode_oes1x1_tria3_payload,
+)
 from .decoders.oes_solid import decode_oes_solid
 from .decoders.oes_bar import decode_oes_bar
 from .decoders.oes_cbush import decode_oes_cbush
@@ -47,6 +51,9 @@ from .decoders.oesnlxr import (
     decode_oesnlxr_cbeam,
     decode_oesnlxr_cbush,
     decode_oesnlxr_ctetra,
+    decode_oesnlxr_shell,
+    SHELL_NL_STRESS_COLS,
+    SHELL_NL_STRAIN_COLS,
 )
 from .decoders.geom_dat import parse_dat, GeomData
 
@@ -308,7 +315,10 @@ class OP2:
                 warnings.warn(f"{label} header rec {hdr}: {exc}", RuntimeWarning)
                 continue
             if sc in result:
-                result[sc] = pd.concat([result[sc], df], ignore_index=True)
+                result[sc] = pd.concat(
+                    [result[sc], df.dropna(axis=1, how="all")],
+                    ignore_index=True,
+                )
             else:
                 result[sc] = df
         return result
@@ -331,7 +341,7 @@ class OP2:
         -------
         dict
             ``{subcase_id: DataFrame}`` with columns
-            ``GRID, COMP, CP, DX, DY, DZ, RX, RY, RZ``.
+            ``GRID, TX, TY, TZ, RX, RY, RZ``.
         """
         return self._cached(
             "displacements",
@@ -340,29 +350,47 @@ class OP2:
             ),
         )
 
-    def stresses(self) -> Dict[int, pd.DataFrame]:
+    def stresses(
+        self,
+        location: str = "max",
+    ) -> Dict[int, pd.DataFrame]:
         """
         Decode all OES1X1 **shell** stress blocks.
 
-        When the OP2 was written with ``STRESS(CORNER)`` the decoder
-        automatically uses the corner-aware path (NUMWDE=87 for CQUAD4);
-        centroid-only output (NUMWDE=17–19) and CTRIA3 single-layer
-        output are also handled.
+        Parameters
+        ----------
+        location : {"max", "centroid"}, default "max"
+            Controls which stress values are reported when the OP2 contains
+            corner-node output (``STRESS(CORNER)``, NUMWDE=87).
+
+            ``"max"``
+                One row per element containing the **maximum** value of each
+                stress column across all four corner nodes.  This represents
+                the worst-case stress anywhere in the element and is the
+                default because corner stresses are generally more accurate
+                than centroid extrapolations.
+            ``"centroid"``
+                One row per element containing the centroid (average)
+                stresses as written by the solver.
+
+            When the OP2 was written centroid-only (NUMWDE=17 or 19) this
+            parameter has no effect and the centroid values are always returned.
 
         Returns
         -------
         dict
-            ``{subcase_id: DataFrame}``.
-
-            *Centroid-only output* columns:
-            ``EID, FD1, SX1, SY1, TXY1, ANG1, MAJOR1, MINOR1, VM1,
-            FD2, SX2, SY2, TXY2, ANG2, MAJOR2, MINOR2, VM2``.
-
-            *Corner output* adds a ``GRID`` column (``GRID=0`` for the
-            centroid row, actual grid ID for each corner row).
+            ``{subcase_id: DataFrame}`` with columns
+            ``EID, FD1, SX1, SY1, TXY1, ANG1, MAX_PRIN1, MIN_PRIN1, VON_MISES1,
+            FD2, SX2, SY2, TXY2, ANG2, MAX_PRIN2, MIN_PRIN2, VON_MISES2``.
         """
+        if location not in ("max", "centroid"):
+            raise ValueError(f"location must be 'max' or 'centroid', got {location!r}")
+
+        cache_key = f"stresses_{location}"
+
         def _compute():
             import struct as _struct
+
             inv = self.inventory
             shell_blocks = classify_oes_headers(inv)[0]
             result: Dict[int, pd.DataFrame] = {}
@@ -377,9 +405,28 @@ class OP2:
                         numwde = _struct.unpack(f"{inv.endian}146i", rec_e.data)[9]
                 try:
                     if numwde == 87:
-                        df = decode_oes1x1_shell_corners(inv, hdr, ekey_idx)
+                        df_full = decode_oes1x1_shell_corners(inv, hdr, ekey_idx)
+                        stress_cols = [
+                            c for c in df_full.columns if c not in ("EID", "GRID")
+                        ]
+                        if location == "max":
+                            # Max of each stress column across the 4 corner nodes
+                            corners = df_full[df_full["GRID"] != 0]
+                            df = (
+                                corners.groupby("EID", sort=False)[stress_cols]
+                                .max()
+                                .reset_index()
+                            )
+                        else:  # "centroid"
+                            df = (
+                                df_full[df_full["GRID"] == 0]
+                                .drop(columns=["GRID"])
+                                .reset_index(drop=True)
+                            )
+                        df.attrs.update(df_full.attrs)
                     elif numwde == 17:
                         from .decoders.oes_peek import load_data_bytes
+
                         payload, data_idx, _all_recs = load_data_bytes(
                             inv, ekey_idx if ekey_idx is not None else hdr
                         )
@@ -391,37 +438,193 @@ class OP2:
                         df = decode_oes1x1_shell(inv, hdr, ekey_idx)
                 except Exception as exc:
                     import warnings as _w
+
                     _w.warn(f"OES1X1-shell header rec {hdr}: {exc}", RuntimeWarning)
                     continue
                 if sc in result:
-                    result[sc] = pd.concat([result[sc], df], ignore_index=True)
+                    result[sc] = pd.concat(
+                        [result[sc], df.dropna(axis=1, how="all")],
+                        ignore_index=True,
+                    )
                 else:
                     result[sc] = df
             return result
 
-        return self._cached("stresses", _compute)
+        return self._cached(cache_key, _compute)
 
-
-    def solid_stresses(self) -> Dict[int, pd.DataFrame]:
+    def stress_tensors(
+        self,
+        location: str = "max",
+    ) -> Dict[int, pd.DataFrame]:
         """
-        Decode all OES1X1 **solid** element stress blocks
-        (CHEXA / CPENTA / CTETRA).
+        Extract the normal and shear stress components needed to assemble
+        2D in-plane stress tensors.
+
+        For each element and fiber layer the in-plane stress tensor is::
+
+            ⎡ SX   TXY ⎤
+            ⎣ TXY   SY ⎦
+
+        Components are returned for both fiber layers (bottom Z1 and top Z2).
+
+        Parameters
+        ----------
+        location : {"max", "centroid"}, default "max"
+            Same meaning as in :meth:`stresses`.  Passed through so the
+            tensor components come from the same source as the full stress
+            table.
 
         Returns
         -------
         dict
             ``{subcase_id: DataFrame}`` with columns
-            ``EID, GRID, SX, SY, SZ, SXY, SYZ, SZX, VM``.
-            Rows with ``GRID == 0`` are the centroid average.
+            ``EID, SX1, SY1, TXY1, SX2, SY2, TXY2``.
+
+            To build a numpy tensor for a single element in subcase 1::
+
+                row = df[df["EID"] == eid].iloc[0]
+                T1 = np.array([[row.SX1, row.TXY1],
+                               [row.TXY1, row.SY1]])
+                T2 = np.array([[row.SX2, row.TXY2],
+                               [row.TXY2, row.SY2]])
         """
-        return self._cached(
-            "solid_stresses",
-            lambda: self._decode_all(
+        _TENSOR_COLS = ["EID", "SX1", "SY1", "TXY1", "SX2", "SY2", "TXY2"]
+
+        def _compute():
+            raw = self.stresses(location=location)
+            out: Dict[int, pd.DataFrame] = {}
+            for sc, df in raw.items():
+                present = [c for c in _TENSOR_COLS if c in df.columns]
+                out[sc] = df[present].reset_index(drop=True)
+            return out
+
+        cache_key = f"stress_tensors_{location}"
+        return self._cached(cache_key, _compute)
+
+    def solid_stresses(
+        self,
+        location: str = "max",
+    ) -> Dict[int, pd.DataFrame]:
+        """
+        Decode all OES1X1 **solid** element stress blocks
+        (CHEXA / CPENTA / CTETRA).
+
+        Parameters
+        ----------
+        location : {"max", "centroid"}, default "max"
+            Controls which values are returned when the OP2 contains
+            corner-node output (multiple GRID rows per element).
+
+            ``"max"``
+                One row per element containing the **maximum** value of each
+                stress component across all corner nodes.  The ``GRID``
+                column is omitted.
+            ``"centroid"``
+                One row per element using the centroid row (``GRID == 0``).
+                The ``GRID`` column is omitted.
+            ``"all"``
+                All rows (centroid + every corner node) with the ``GRID``
+                column included.  This is the raw decoded output.
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns
+            ``EID, SX, SY, SZ, SXY, SYZ, SZX, VON_MISES``
+            (plus ``GRID`` when ``location='all'``).
+        """
+        if location not in ("max", "centroid", "all"):
+            raise ValueError(
+                f"location must be 'max', 'centroid', or 'all', got {location!r}"
+            )
+
+        def _compute_all():
+            return self._decode_all(
                 classify_oes_headers(self.inventory)[1],
                 decode_oes_solid,
                 "OES1X1-solid",
-            ),
-        )
+            )
+
+        all_data = self._cached("solid_stresses_all", _compute_all)
+
+        if location == "all":
+            return all_data
+
+        cache_key = f"solid_stresses_{location}"
+
+        def _compute():
+            stress_cols = ["SX", "SY", "SZ", "SXY", "SYZ", "SZX", "VON_MISES"]
+            out: Dict[int, pd.DataFrame] = {}
+            for sc, df in all_data.items():
+                present = [c for c in stress_cols if c in df.columns]
+                if location == "max":
+                    corners = df[df["GRID"] != 0]
+                    out[sc] = (
+                        corners.groupby("EID", sort=False)[present].max().reset_index()
+                    )
+                else:  # "centroid"
+                    out[sc] = df[df["GRID"] == 0][["EID"] + present].reset_index(
+                        drop=True
+                    )
+            return out
+
+        return self._cached(cache_key, _compute)
+
+    def solid_stress_tensors(
+        self,
+        location: str = "max",
+    ) -> Dict[int, pd.DataFrame]:
+        """
+        Extract the normal and shear stress components for solid elements
+        (CHEXA / CPENTA / CTETRA) needed to assemble 3D stress tensors.
+
+        For each element the 3D symmetric stress tensor is::
+
+            ⎡ SX   SXY  SZX ⎤
+            ⎢ SXY   SY  SYZ ⎥
+            ⎣ SZX  SYZ   SZ ⎦
+
+        Parameters
+        ----------
+        location : {"max", "centroid"}, default "max"
+            Controls which values are returned when the OP2 contains
+            corner-node output (multiple GRID rows per element).
+
+            ``"max"``
+                One row per element containing the **maximum** value of each
+                stress component across all corner nodes.
+            ``"centroid"``
+                One row per element using the centroid row (``GRID == 0``).
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns
+            ``EID, SX, SY, SZ, SXY, SYZ, SZX``.
+
+            To build a numpy tensor for a single element in subcase 1::
+
+                row = df[df["EID"] == eid].iloc[0]
+                T = np.array([[row.SX,  row.SXY, row.SZX],
+                              [row.SXY, row.SY,  row.SYZ],
+                              [row.SZX, row.SYZ, row.SZ ]])
+        """
+        if location not in ("max", "centroid"):
+            raise ValueError(f"location must be 'max' or 'centroid', got {location!r}")
+
+        _TENSOR_COLS = ["EID", "SX", "SY", "SZ", "SXY", "SYZ", "SZX"]
+
+        def _compute():
+            stress_cols = ["SX", "SY", "SZ", "SXY", "SYZ", "SZX"]
+            out: Dict[int, pd.DataFrame] = {}
+            for sc, df in self.solid_stresses(location=location).items():
+                present_stress = [c for c in stress_cols if c in df.columns]
+                present = [c for c in _TENSOR_COLS if c in df.columns]
+                out[sc] = df[["EID"] + present_stress].reset_index(drop=True)
+            return out
+
+        cache_key = f"solid_stress_tensors_{location}"
+        return self._cached(cache_key, _compute)
 
     def bar_stresses(self) -> Dict[int, pd.DataFrame]:
         """
@@ -616,8 +819,8 @@ class OP2:
         -------
         dict
             ``{subcase_id: DataFrame}`` with columns
-            ``EID, LOC, FD1, EX1, EY1, EXY1, ET1Z1, ET2Z1, EANG1, EMAJOR1,
-            FD2, EX2, EY2, EXY2, ET1Z2, ET2Z2, EANG2, EMAJOR2``.
+            ``EID, FD1, EX1, EY1, EXY1, EANG1, EMAX_PRIN1, EMIN_PRIN1, EVON_MISES1,
+            FD2, EX2, EY2, EXY2, EANG2, EMAX_PRIN2, EMIN_PRIN2, EVON_MISES2``.
         """
         return self._cached(
             "strains",
@@ -963,8 +1166,8 @@ class OP2:
         -------
         dict
             ``{subcase_id: DataFrame}`` with columns
-            ``EID, GRID, FD1, SX1, SY1, TXY1, ANG1, MAJOR1, MINOR1, VM1,
-            FD2, SX2, SY2, TXY2, ANG2, MAJOR2, MINOR2, VM2``.
+            ``EID, GRID, FD1, SX1, SY1, TXY1, ANG1, MAX_PRIN1, MIN_PRIN1, VON_MISES1,
+            FD2, SX2, SY2, TXY2, ANG2, MAX_PRIN2, MIN_PRIN2, VON_MISES2``.
         """
         return self._cached(
             "stresses_corners",
@@ -989,7 +1192,9 @@ class OP2:
         """
 
         def _compute():
-            cbeam_blocks, _cbush, _ctetra = classify_oesnlxr_headers(self.inventory)
+            cbeam_blocks, _cbush, _ctetra, _shell = classify_oesnlxr_headers(
+                self.inventory
+            )
             return self._decode_all(cbeam_blocks, decode_oesnlxr_cbeam, "OESNLXR-cbeam")
 
         return self._cached("nl_bar_stresses", _compute)
@@ -1008,7 +1213,9 @@ class OP2:
         """
 
         def _compute():
-            _cbeam, cbush_blocks, _ctetra = classify_oesnlxr_headers(self.inventory)
+            _cbeam, cbush_blocks, _ctetra, _shell = classify_oesnlxr_headers(
+                self.inventory
+            )
             return self._decode_all(cbush_blocks, decode_oesnlxr_cbush, "OESNLXR-cbush")
 
         return self._cached("nl_bush_stresses", _compute)
@@ -1021,18 +1228,57 @@ class OP2:
         -------
         dict
             ``{subcase_id: DataFrame}`` with columns
-            ``EID, GRID, SX, SY, SZ, SXY, SYZ, SZX, EQ_STRESS,
+            ``EID, GRID, SX, SY, SZ, SXY, SYZ, SZX, VON_MISES,
             EFF_STRAIN_PLAS, EFF_CREEP, EX, EY, EZ, EXY, EYZ, EZX``.
             ``GRID == 0`` rows are the element centroid.
         """
 
         def _compute():
-            _cbeam, _cbush, ctetra_blocks = classify_oesnlxr_headers(self.inventory)
+            _cbeam, _cbush, ctetra_blocks, _shell = classify_oesnlxr_headers(
+                self.inventory
+            )
             return self._decode_all(
                 ctetra_blocks, decode_oesnlxr_ctetra, "OESNLXR-ctetra"
             )
 
         return self._cached("nl_solid_stresses", _compute)
+
+    def _nl_shell_raw(self) -> Dict[int, pd.DataFrame]:
+        """Decode all OESNLXR shell blocks; cached with all columns."""
+
+        def _compute():
+            _cbeam, _cbush, _ctetra, shell_blocks = classify_oesnlxr_headers(
+                self.inventory
+            )
+            return self._decode_all(shell_blocks, decode_oesnlxr_shell, "OESNLXR-shell")
+
+        return self._cached("_nl_shell_raw", _compute)
+
+    def nl_shell_stresses(self) -> Dict[int, pd.DataFrame]:
+        """
+        Decode all OESNLXR nonlinear **CQUAD4/CTRIA3** stress blocks.
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns
+            ``EID, FIBER, FD, SX, SY, TXY, VON_MISES``.
+            Two rows per element (FIBER=1 bottom, FIBER=2 top).
+        """
+        return {sc: df[SHELL_NL_STRESS_COLS] for sc, df in self._nl_shell_raw().items()}
+
+    def nl_shell_strains(self) -> Dict[int, pd.DataFrame]:
+        """
+        Decode all OESNLXR nonlinear **CQUAD4/CTRIA3** strain blocks.
+
+        Returns
+        -------
+        dict
+            ``{subcase_id: DataFrame}`` with columns
+            ``EID, FIBER, FD, EX, EY, EXY, EFF_STRAIN_PLAS, EFF_CREEP``.
+            Two rows per element (FIBER=1 bottom, FIBER=2 top).
+        """
+        return {sc: df[SHELL_NL_STRAIN_COLS] for sc, df in self._nl_shell_raw().items()}
 
     def results(self, subcase: int = 1) -> "Results":
         """
@@ -1064,7 +1310,7 @@ class OP2:
     def envelope(
         self,
         result: str = "stresses",
-        column: str = "VM1",
+        column: str = "VON_MISES1",
         mode: str = "max",
     ) -> pd.DataFrame:
         """
@@ -1083,7 +1329,7 @@ class OP2:
             ``"stresses"``, ``"element_forces"``, ``"strains"``,
             ``"spc_forces"``.  Default ``"stresses"``.
         column : str
-            The numeric column to take the extreme over.  Default ``"VM1"``.
+            The numeric column to take the extreme over.  Default ``"VON_MISES1"``.
         mode : {"max", "min", "absmax"}
             * ``"max"``    — highest (most positive) value
             * ``"min"``    — lowest (most negative) value
@@ -1099,7 +1345,7 @@ class OP2:
 
         Examples
         --------
-        >>> worst = op2.envelope("stresses", "VM1", "absmax")
+        >>> worst = op2.envelope("stresses", "VON_MISES1", "absmax")
         >>> worst.head()
         """
         method = getattr(self, result, None)
@@ -1225,7 +1471,7 @@ class OP2:
         the file.
 
         Each row in the output corresponds to one numeric column in one
-        result table (e.g. ``stresses/VM1``).  The columns are the standard
+        result table (e.g. ``stresses/VON_MISES1``).  The columns are the standard
         descriptive statistics: count, mean, std, min, 25%, 50%, 75%, max.
 
         Returns
@@ -1257,6 +1503,8 @@ class OP2:
             "nl_bar_stresses": self.nl_bar_stresses,
             "nl_bush_stresses": self.nl_bush_stresses,
             "nl_solid_stresses": self.nl_solid_stresses,
+            "nl_shell_stresses": self.nl_shell_stresses,
+            "nl_shell_strains": self.nl_shell_strains,
         }
         rows = []
         for name, method in result_methods.items():
@@ -1320,6 +1568,8 @@ class OP2:
             "nl_bar_stresses": self.nl_bar_stresses(),
             "nl_bush_stresses": self.nl_bush_stresses(),
             "nl_solid_stresses": self.nl_solid_stresses(),
+            "nl_shell_stresses": self.nl_shell_stresses(),
+            "nl_shell_strains": self.nl_shell_strains(),
         }
         out: Dict[str, pd.DataFrame] = {}
         for name, subcase_dict in sources.items():
@@ -1412,6 +1662,8 @@ class OP2:
             "nl_bar_stresses": self.nl_bar_stresses(),
             "nl_bush_stresses": self.nl_bush_stresses(),
             "nl_solid_stresses": self.nl_solid_stresses(),
+            "nl_shell_stresses": self.nl_shell_stresses(),
+            "nl_shell_strains": self.nl_shell_strains(),
             "eigenvalues": self.eigenvalues(),
         }
 
@@ -1438,6 +1690,170 @@ class OP2:
     # ------------------------------------------------------------------
     # Diagnostics
     # ------------------------------------------------------------------
+
+    _METADATA_TABLES = frozenset(
+        {
+            "NX2412",
+            "PVT0",
+            "PVT",
+            "CASECC",
+            "CASECC1",
+            "EQEXIN",
+            "EQEXINS",
+        }
+    )
+
+    def file_info(self) -> dict:
+        """
+        Return a dictionary of file-level metadata.
+
+        Parses lightweight header records only — no result data is decoded.
+
+        Returns
+        -------
+        dict with keys:
+
+        ``path``
+            Absolute path to the OP2 file.
+        ``product``
+            Nastran product string, e.g. ``'NX Nastran'``.
+        ``endian``
+            Byte order: ``'little'`` or ``'big'``.
+        ``result_tables``
+            Sorted list of result table names present in the file
+            (metadata tables are excluded).  Examples: ``['OES1X1',
+            'OESNLXR', 'OUGV1']``.
+        ``solution_type``
+            Human-readable description of the analysis type, inferred
+            from the result tables present.
+        ``n_subcases``
+            Number of unique subcase IDs found.
+        ``params``
+            Dict of solution parameters parsed from the PVT table.
+            Keys are parameter names (e.g. ``'AUTOSPC'``, ``'K6ROT'``,
+            ``'LGDISP'``).  Values are ``int``, ``float``, or ``str``.
+
+        Examples
+        --------
+        >>> op2 = OP2("model.op2")
+        >>> info = op2.file_info()
+        >>> info['solution_type']
+        'Nonlinear Static (SOL 106)'
+        >>> info['params']['LGDISP']
+        1
+        """
+        inv = self.inventory
+        bo = inv.endian  # '<' or '>'
+
+        # ── 1. All unique 8-byte table names ──────────────────────────
+        all_tables: set = {
+            rec.data.rstrip(b"\x00 ").decode("latin-1", errors="replace")
+            for rec in inv.records
+            if rec.info.length == 8
+        }
+        result_tables = sorted(all_tables - self._METADATA_TABLES)
+
+        # ── 2. Product ────────────────────────────────────────────────
+        product = "NX Nastran" if "NX2412" in all_tables else "MSC Nastran"
+
+        # ── 3. Solution type (inferred from tables present) ───────────
+        has_lama = "LAMA" in all_tables
+        has_nlxr = "OESNLXR" in all_tables
+        has_onrgy = any(t.startswith("ONRGY") for t in all_tables)
+        has_freq = "OESATO1" in all_tables or "OUPV1" in all_tables
+
+        if has_lama and has_onrgy:
+            sol_type = "Normal Modes (SOL 103)"
+        elif has_lama:
+            sol_type = "Buckling (SOL 105)"
+        elif has_nlxr:
+            sol_type = "Nonlinear Static (SOL 106)"
+        elif has_freq:
+            sol_type = "Frequency Response (SOL 108/111)"
+        else:
+            sol_type = "Linear Static (SOL 101)"
+
+        # ── 4. Subcases ───────────────────────────────────────────────
+        sc_df = self.subcases()
+        n_subcases = len(sc_df) if not sc_df.empty else 0
+
+        # ── 5. PVT parameters ─────────────────────────────────────────
+        params = self._parse_pvt_params(bo)
+
+        return {
+            "path": str(self.path.resolve()),
+            "product": product,
+            "endian": "little" if bo == "<" else "big",
+            "result_tables": result_tables,
+            "solution_type": sol_type,
+            "n_subcases": n_subcases,
+            "params": params,
+        }
+
+    def _parse_pvt_params(self, endian: str = "<") -> dict:
+        """
+        Parse the PVT solution-parameter block into a plain dict.
+
+        Each entry in the block has the form::
+
+            [8-char keyword][4-byte type][value bytes]
+
+        where type=1 → int (4 bytes), type=2 → float32 (4 bytes),
+        type=3 → char8 (8 bytes).
+        """
+        import struct as _struct
+
+        bo = endian  # '<' or '>'
+        inv = self.inventory
+        current_table: Optional[str] = None
+        pvt_data: Optional[bytes] = None
+
+        for rec in inv.records:
+            if rec.info.length == 8:
+                current_table = rec.data.rstrip(b"\x00 ").decode(
+                    "latin-1", errors="replace"
+                )
+            elif current_table == "PVT" and rec.info.length > 8:
+                pvt_data = rec.data[: rec.info.length]
+                break
+
+        if pvt_data is None:
+            return {}
+
+        params: dict = {}
+        pos = 0
+        n = len(pvt_data)
+        while pos + 12 <= n:  # minimum: 8 (keyword) + 4 (type)
+            keyword = (
+                pvt_data[pos : pos + 8].decode("latin-1", errors="replace").rstrip()
+            )
+            pos += 8
+            type_code = _struct.unpack_from(bo + "i", pvt_data, pos)[0]
+            pos += 4
+
+            if type_code == 1:  # integer
+                if pos + 4 > n:
+                    break
+                val: object = _struct.unpack_from(bo + "i", pvt_data, pos)[0]
+                pos += 4
+            elif type_code == 2:  # real (float32)
+                if pos + 4 > n:
+                    break
+                val = float(_struct.unpack_from(bo + "f", pvt_data, pos)[0])
+                pos += 4
+            elif type_code == 3:  # char8
+                if pos + 8 > n:
+                    break
+                val = (
+                    pvt_data[pos : pos + 8].decode("latin-1", errors="replace").rstrip()
+                )
+                pos += 8
+            else:
+                break  # unknown type — stop parsing
+
+            params[keyword] = val
+
+        return params
 
     def subcases(self) -> pd.DataFrame:
         """
@@ -1480,6 +1896,8 @@ class OP2:
             "nl_bar_stresses": self.nl_bar_stresses,
             "nl_bush_stresses": self.nl_bush_stresses,
             "nl_solid_stresses": self.nl_solid_stresses,
+            "nl_shell_stresses": self.nl_shell_stresses,
+            "nl_shell_strains": self.nl_shell_strains,
         }
         # Collect (subcase, result_name, n_rows) triples
         rows: list = []
@@ -1543,7 +1961,9 @@ class OP2:
                     kr = inv.records[k]
                     if kr.info.length != n_words * 4:
                         continue
-                    raw = np.frombuffer(kr.data, dtype="<i4").reshape(-1, 2)
+                    raw = np.frombuffer(inv.get_record_data(k), dtype="<i4").reshape(
+                        -1, 2
+                    )
                     grids = raw[:, 0]
                     # Sanity: grid IDs should be small positive integers
                     if int(grids.min()) >= 1 and int(grids.max()) < 10_000_000:
@@ -1665,6 +2085,8 @@ class Results:
         self.nl_bar_stresses = self._get(op2.nl_bar_stresses())
         self.nl_bush_stresses = self._get(op2.nl_bush_stresses())
         self.nl_solid_stresses = self._get(op2.nl_solid_stresses())
+        self.nl_shell_stresses = self._get(op2.nl_shell_stresses())
+        self.nl_shell_strains = self._get(op2.nl_shell_strains())
 
     def __repr__(self) -> str:
         parts = []
@@ -1690,6 +2112,8 @@ class Results:
             "nl_bar_stresses",
             "nl_bush_stresses",
             "nl_solid_stresses",
+            "nl_shell_stresses",
+            "nl_shell_strains",
         ):
             df = getattr(self, attr)
             if not df.empty:

@@ -33,7 +33,7 @@ Output columns
   GRID         grid point id (0 = centroid)
   SX SY SZ     normal stresses
   SXY SYZ SZX  shear stresses
-  VM           von Mises stress (or pressure P for some output requests)
+  VON_MISES    von Mises stress (or pressure P for some output requests)
 """
 from __future__ import annotations
 
@@ -59,7 +59,7 @@ _ETYPE_TO_NROWS: dict[int, int] = {
 }
 
 _WORDS_PER_GP = 8  # grid_id + 7 stress/strain floats
-_OUT_COLS = ["EID", "GRID", "SX", "SY", "SZ", "SXY", "SYZ", "SZX", "VM"]
+_OUT_COLS = ["EID", "GRID", "SX", "SY", "SZ", "SXY", "SYZ", "SZX", "VON_MISES"]
 
 # Extended MSC CTETRA/CPENTA/CHEXA format (NUMWDE 109/169/256):
 #   Each element block: 1 EID word + 1 centroid row + N corner rows
@@ -78,9 +78,9 @@ _EXT_NUMWDE_NROWS: dict[int, int] = {
 }
 _EXT_NCOLS = 8  # EID + GRID + 6 stress floats mapped to SX..SZX
 # For the extended format we output the first 6 float fields of each row.
-# Centroid row: grid=0, fields w[1..6] → SX SY SZ SXY SYZ SZX (VM not stored separately)
+# Centroid row: grid=0, fields w[1..6] → SX SY SZ SXY SYZ SZX (VON_MISES not stored separately)
 # Corner rows:  grid=grid_id, fields w[1..6]
-_EXT_OUT_COLS = ["EID", "GRID", "SX", "SY", "SZ", "SXY", "SYZ", "SZX", "VM"]
+_EXT_OUT_COLS = ["EID", "GRID", "SX", "SY", "SZ", "SXY", "SYZ", "SZX", "VON_MISES"]
 
 
 def _elem_type_from_ekey(inv: OP2Inventory, start_index: int) -> Optional[int]:

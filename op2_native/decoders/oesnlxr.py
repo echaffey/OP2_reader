@@ -7,6 +7,8 @@ Supported element types
 etype  94  CBEAM   nonlinear  numwde=51
 etype 226  CBUSH   nonlinear  numwde=19
 etype  85  CTETRA  nonlinear  numwde=82
+etype  90  CQUAD4  nonlinear  numwde=25
+etype  88  CTRIA3  nonlinear  numwde=25
 
 CBEAM NL binary layout  (51 words per element)
 ----------------------------------------------
@@ -45,11 +47,11 @@ CTETRA NL binary layout  (82 words per element)
   5 x 16-word node blocks  (centroid then 4 corner nodes):
     word  0        : GRID_ID  (int;  0 for centroid)
     words  1..6    : SX, SY, SZ, SXY, SYZ, SZX  (stresses)
-    words  7..9    : EQ_STRESS, EFF_STRAIN_PLAS, EFF_CREEP
+    words  7..9    : VON_MISES, EFF_STRAIN_PLAS, EFF_CREEP
     words 10..15   : EX, EY, EZ, EXY, EYZ, EZX  (total strains)
 
 Output columns (one row per node per element):
-  EID, GRID, SX, SY, SZ, SXY, SYZ, SZX, EQ_STRESS, EFF_STRAIN_PLAS,
+  EID, GRID, SX, SY, SZ, SXY, SYZ, SZX, VON_MISES, EFF_STRAIN_PLAS,
   EFF_CREEP, EX, EY, EZ, EXY, EYZ, EZX
 """
 from __future__ import annotations
@@ -67,11 +69,16 @@ from .oes_peek import load_data_bytes, first_data_record_after_ekey
 _CBEAM_NL_ETYPE = 94
 _CBUSH_NL_ETYPE = 226
 _CTETRA_NL_ETYPE = 85
+_CQUAD4_NL_ETYPE = 90
+_CTRIA3_NL_ETYPE = 88
 
 # Row widths in words
 _CBEAM_NL_NUMWDE = 51
 _CBUSH_NL_NUMWDE = 19
 _CTETRA_NL_NUMWDE = 82
+_SHELL_NL_NUMWDE = 25
+
+_SHELL_NL_ETYPES = frozenset([_CQUAD4_NL_ETYPE, _CTRIA3_NL_ETYPE])
 
 # Output column names
 _CBEAM_NL_COLS = [
@@ -116,7 +123,7 @@ _CTETRA_NL_COLS = [
     "SXY",
     "SYZ",
     "SZX",
-    "EQ_STRESS",
+    "VON_MISES",
     "EFF_STRAIN_PLAS",
     "EFF_CREEP",
     "EX",
@@ -129,6 +136,34 @@ _CTETRA_NL_COLS = [
 
 # Fiber labels in output order
 _FIBER_LABELS = ["C", "D", "E", "F"]
+
+_SHELL_NL_COLS = [
+    "EID",
+    "FIBER",
+    "FD",
+    "SX",
+    "SY",
+    "TXY",
+    "VON_MISES",
+    "EFF_STRAIN_PLAS",
+    "EFF_CREEP",
+    "EX",
+    "EY",
+    "EXY",
+]
+
+# Column subsets exposed via the public reader methods
+SHELL_NL_STRESS_COLS = ["EID", "FIBER", "FD", "SX", "SY", "TXY", "VON_MISES"]
+SHELL_NL_STRAIN_COLS = [
+    "EID",
+    "FIBER",
+    "FD",
+    "EX",
+    "EY",
+    "EXY",
+    "EFF_STRAIN_PLAS",
+    "EFF_CREEP",
+]
 
 
 def _decode_cbeam_nl_payload(
@@ -296,6 +331,80 @@ def _decode_ctetra_nl_payload(
     return pd.DataFrame(rows, columns=_CTETRA_NL_COLS)
 
 
+def _decode_shell_nl_payload(
+    data: bytes,
+    endian: str = "<",
+    max_eid: int = 10_000_000,
+) -> pd.DataFrame:
+    """Decode CQUAD4/CTRIA3 NL stress: 25 words per element, 2 rows per element.
+
+    Layout (words):
+      0  : packed_eid_device
+      1  : FD1 (fiber distance, bottom)
+      2  : SX1
+      3  : SY1
+      4  : SZ1 (NaN, not applicable for shell)
+      5  : TXY1
+      6  : VM1 (equivalent stress)
+      7  : EFF_STRAIN_PLAS1 (effective plastic/nonlinear-elastic strain)
+      8  : EFF_CREEP1
+      9  : EX1 (total strain X)
+     10  : EY1 (total strain Y)
+     11  : EZ1 (NaN)
+     12  : EXY1 (total strain XY)
+     13  : FD2 (fiber distance, top)
+     14-24: same layout as words 1-12 for fiber 2
+    """
+    stride = _SHELL_NL_NUMWDE
+    n_words = len(data) // 4
+    if n_words < stride:
+        return pd.DataFrame(columns=_SHELL_NL_COLS)
+
+    bo = "<" if endian == "<" else ">"
+    ints = np.frombuffer(data[: n_words * 4], dtype=f"{bo}i4")
+    floats = np.frombuffer(data[: n_words * 4], dtype=f"{bo}f4")
+
+    rows: List[list] = []
+    n_elems = n_words // stride
+    for elem in range(n_elems):
+        base = elem * stride
+        raw = int(ints[base])
+        if raw <= 0:
+            break
+        eid = raw // 10
+        loc = raw % 10
+        if not (1 <= loc <= 9 and 1 <= eid <= max_eid):
+            break
+        # Fiber 1 (bottom, words 1-12)
+        fd1 = float(floats[base + 1])
+        sx1 = float(floats[base + 2])
+        sy1 = float(floats[base + 3])
+        # word 4 = SZ1 (NaN), skip
+        txy1 = float(floats[base + 5])
+        vm1 = float(floats[base + 6])
+        plas1 = float(floats[base + 7])
+        creep1 = float(floats[base + 8])
+        ex1 = float(floats[base + 9])
+        ey1 = float(floats[base + 10])
+        # word 11 = EZ1 (NaN), skip
+        exy1 = float(floats[base + 12])
+        rows.append([eid, 1, fd1, sx1, sy1, txy1, vm1, plas1, creep1, ex1, ey1, exy1])
+        # Fiber 2 (top, words 13-24)
+        fd2 = float(floats[base + 13])
+        sx2 = float(floats[base + 14])
+        sy2 = float(floats[base + 15])
+        txy2 = float(floats[base + 17])
+        vm2 = float(floats[base + 18])
+        plas2 = float(floats[base + 19])
+        creep2 = float(floats[base + 20])
+        ex2 = float(floats[base + 21])
+        ey2 = float(floats[base + 22])
+        exy2 = float(floats[base + 24])
+        rows.append([eid, 2, fd2, sx2, sy2, txy2, vm2, plas2, creep2, ex2, ey2, exy2])
+
+    return pd.DataFrame(rows, columns=_SHELL_NL_COLS)
+
+
 # ---------------------------------------------------------------------------
 # EKEY scanner
 # ---------------------------------------------------------------------------
@@ -323,15 +432,16 @@ def _find_oesnlxr_ekeys(
 
 def classify_oesnlxr_headers(
     inv: OP2Inventory,
-) -> Tuple[List[Tuple], List[Tuple], List[Tuple]]:
+) -> Tuple[List[Tuple], List[Tuple], List[Tuple], List[Tuple]]:
     """
     Classify every OESNLXR element-type sub-block by element type.
 
     Returns
     -------
-    cbeam_blocks, cbush_blocks, ctetra_blocks
+    cbeam_blocks, cbush_blocks, ctetra_blocks, shell_blocks
         Each is a list of ``(header_idx, ekey_idx, sc_offset)`` 3-tuples.
         ``sc_offset`` is 0 for the first subcase block, 1 for the second, etc.
+        ``shell_blocks`` covers both CQUAD4 NL (etype 90) and CTRIA3 NL (etype 88).
     """
     from .oes_search import _find_token
 
@@ -339,6 +449,7 @@ def classify_oesnlxr_headers(
     cbeam: List[Tuple] = []
     cbush: List[Tuple] = []
     ctetra: List[Tuple] = []
+    shell: List[Tuple] = []
     for hdr in token_hits:
         etype_count: Dict[int, int] = {}
         for ekey_idx, _first_data, etype, _numwde in _find_oesnlxr_ekeys(inv, hdr):
@@ -351,7 +462,9 @@ def classify_oesnlxr_headers(
                 cbush.append(entry)
             elif etype == _CTETRA_NL_ETYPE:
                 ctetra.append(entry)
-    return cbeam, cbush, ctetra
+            elif etype in _SHELL_NL_ETYPES:
+                shell.append(entry)
+    return cbeam, cbush, ctetra, shell
 
 
 # ---------------------------------------------------------------------------
@@ -416,4 +529,25 @@ def decode_oesnlxr_ctetra(
     df.attrs["data_record"] = data_idx
     df.attrs["all_data_records"] = all_recs
     df.attrs["element_type"] = _CTETRA_NL_ETYPE
+    return df
+
+
+def decode_oesnlxr_shell(
+    inv: OP2Inventory, header_index: int, ekey_index: int = None
+) -> pd.DataFrame:
+    """Decode CQUAD4/CTRIA3 NL stress block from OESNLXR."""
+    if ekey_index is not None:
+        first_idx = first_data_record_after_ekey(
+            inv, ekey_index, min_data_bytes=_SHELL_NL_NUMWDE * 4
+        )
+        payload, data_idx, all_recs = load_data_bytes(
+            inv, ekey_index, first_idx=first_idx
+        )
+    else:
+        payload, data_idx, all_recs = load_data_bytes(inv, header_index)
+
+    df = _decode_shell_nl_payload(payload, inv.endian)
+    df.attrs["header_record"] = header_index
+    df.attrs["data_record"] = data_idx
+    df.attrs["all_data_records"] = all_recs
     return df

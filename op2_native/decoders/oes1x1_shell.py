@@ -21,9 +21,9 @@ WORDS_PER_ELEM = 19  # 1 packed_eid + 2 CEN/ marker words + 16 stress floats
 #   SX, SY    = normal stresses in element system
 #   TXY       = in-plane shear stress
 #   ANG       = angle to principal axis (degrees)
-#   MAJOR     = maximum (major) principal stress (OMAX)
-#   MINOR     = minimum (minor) principal stress (OMIN)
-#   VM        = Von Mises stress (or Max Shear, depending on STRESS case control)
+#   MAX_PRIN  = maximum principal stress (OMAX)
+#   MIN_PRIN  = minimum principal stress (OMIN)
+#   VON_MISES = Von Mises stress (or Max Shear, depending on STRESS case control)
 # (8 words per fiber layer x 2 layers = 16 words total)
 SHELL_STRESS_COLS = [
     "EID",
@@ -33,18 +33,18 @@ SHELL_STRESS_COLS = [
     "SY1",
     "TXY1",
     "ANG1",
-    "MAJOR1",
-    "MINOR1",
-    "VM1",
+    "MAX_PRIN1",
+    "MIN_PRIN1",
+    "VON_MISES1",
     # fiber 2 (top / Z2)
     "FD2",
     "SX2",
     "SY2",
     "TXY2",
     "ANG2",
-    "MAJOR2",
-    "MINOR2",
-    "VM2",
+    "MAX_PRIN2",
+    "MIN_PRIN2",
+    "VON_MISES2",
 ]
 
 # Fallback generic columns (used when full 16-column layout is not available)
@@ -322,8 +322,8 @@ def decode_oes1x1_tria3_payload(
 
     Word layout per element (17 words):
         w0:      packed_eid  (10*EID + device_code)
-        w1..w16: FD1,SX1,SY1,TXY1,ANG1,MAJOR1,MINOR1,VM1,
-                 FD2,SX2,SY2,TXY2,ANG2,MAJOR2,MINOR2,VM2
+        w1..w16: FD1,SX1,SY1,TXY1,ANG1,MAX_PRIN1,MIN_PRIN1,VON_MISES1,
+                 FD2,SX2,SY2,TXY2,ANG2,MAX_PRIN2,MIN_PRIN2,VON_MISES2
 
     EID is at the START of each record (unlike CQUAD4 centroid-only format
     where it is at the end).
@@ -441,17 +441,17 @@ def decode_oes1x1_by_marker(
 #   w1        : CEN/ ASCII marker (4 bytes)
 #   w2        : n_corners (=4 for CQUAD4)
 #   w3..w18   : 16 centroid stress floats (8 per fiber × 2 fibers)
-#   w19       : packed corner-1 grid id (10*GRID + device_code)
+#   w19       : corner-1 grid id (plain integer, NOT packed)
 #   w20..w35  : 16 corner-1 stress floats
-#   w36..w52  : packed corner-2 id + 16 floats
-#   w53..w69  : packed corner-3 id + 16 floats
-#   w70..w86  : packed corner-4 id + 16 floats
+#   w36..w52  : corner-2 grid id + 16 floats
+#   w53..w69  : corner-3 grid id + 16 floats
+#   w70..w86  : corner-4 grid id + 16 floats
 # Total: 3 + 5×17 = 3 + 85 = 88 ... but measured gap is 87.
 # Actual: 1(eid) + 2(CEN/,4) + 16(cen_stresses) + 4×(1+16) = 19+68 = 87  ✓
 
 _ELEM_BLOCK_WORDS = 87  # words per CQUAD4 element including centroid + 4 corners
 _CEN_STRESS_OFFSET = 3  # centroid stresses start at word 3 within the block
-_CORNER_STRIDE = 17  # 1 packed-grid-id + 16 stresses
+_CORNER_STRIDE = 17  # 1 grid-id + 16 stresses
 _N_CORNERS = 4
 
 # Column list with an extra GRID column (centroid uses GRID=0)
@@ -477,8 +477,8 @@ def decode_oes1x1_shell_corners(
 
     Columns
     -------
-    EID, GRID, FD1, SX1, SY1, TXY1, ANG1, MAJOR1, MINOR1, VM1,
-    FD2, SX2, SY2, TXY2, ANG2, MAJOR2, MINOR2, VM2
+    EID, GRID, FD1, SX1, SY1, TXY1, ANG1, MAX_PRIN1, MIN_PRIN1, VON_MISES1,
+    FD2, SX2, SY2, TXY2, ANG2, MAX_PRIN2, MIN_PRIN2, VON_MISES2
     """
     payload, data_rec_idx, _all_recs = load_data_bytes(
         inv, ekey_index if ekey_index is not None else oes_header_index
@@ -535,14 +535,11 @@ def decode_oes1x1_shell_corners(
             if corner_start + _CORNER_STRIDE > n_words:
                 break
             raw_grid = uints[corner_start]
-            # Packed as 10*GRID + device; for small GRIDs (<=9) the raw value
-            # may equal GRID directly (device_code=0 or stored without packing).
-            if raw_grid >= 10:
-                grid_id = raw_grid // 10
-            elif raw_grid > 0:
-                grid_id = raw_grid  # raw grid ID stored without packing
-            else:
+            # Corner GRID IDs are stored as plain integers (not packed with
+            # device code the way element IDs are).
+            if raw_grid == 0:
                 break
+            grid_id = int(raw_grid)
             if not (0 < grid_id <= max_grid):
                 break
             c_s = _read_floats(corner_start + 1, 16)
@@ -578,12 +575,16 @@ def decode_oes1x1_shell(
     payload, data_rec_idx, _all_recs = load_data_bytes(
         inv, ekey_index if ekey_index is not None else oes_header_index
     )
-    # respect file endianness detected by the reader
-    df = _decode_oes1x1_payload(payload, endian=inv.endian, max_eid=max_eid)
 
-    # Also attempt marker-driven decoding (find 3-word float markers and extract packed ids).
-    # If marker decoding yields rows, prefer those rows and merge with the conventional
-    # decode to fill gaps. This handles mixed layouts where some elements use markers.
+    def _set_attrs(df: pd.DataFrame, method: str) -> pd.DataFrame:
+        df.attrs["header_record"] = oes_header_index
+        df.attrs["data_record"] = data_rec_idx
+        df.attrs["all_data_records"] = _all_recs
+        df.attrs["decode_method"] = method
+        return df
+
+    # Fast path: numpy marker-driven decoder — try this first to avoid the
+    # Python struct.unpack loop entirely for files that use the marker format.
     try:
         df_marker = decode_oes1x1_by_marker(
             payload, endian=inv.endian, float_thr=float_thr
@@ -592,16 +593,13 @@ def decode_oes1x1_shell(
         df_marker = pd.DataFrame()
 
     if not df_marker.empty:
-        # Primary path: marker-driven header detection succeeded — return those rows.
-        df_marker.attrs["header_record"] = oes_header_index
-        df_marker.attrs["data_record"] = data_rec_idx
-        df_marker.attrs["all_data_records"] = _all_recs
-        df_marker.attrs["decode_method"] = "marker"
         df_marker.attrs["marker_matches"] = df_marker.attrs.get("marker_matches")
-        return df_marker
+        return _set_attrs(df_marker, "marker")
 
-    # If no marker-based rows, fall back to alignment detection only when conventional
-    # decode looks too small.
+    # Slow fallback: Python-loop decoder (handles non-marker variants).
+    df = _decode_oes1x1_payload(payload, endian=inv.endian, max_eid=max_eid)
+
+    # If the slow decoder also produced very few rows, try alignment detection.
     try:
         decoded_elems = int(df.attrs.get("decoded_elems", 0))
     except Exception:
@@ -611,14 +609,7 @@ def decode_oes1x1_shell(
         best = detect_eid_alignment(payload, endian=inv.endian, n_check=20)
         if best.get("score", 0) >= 8:
             df_alt = _decode_oes1x1_by_alignment(payload, endian=inv.endian, start=best["start"], pos=best["pos"], signed=best["signed"])  # type: ignore[arg-type]
-            df_alt.attrs["header_record"] = oes_header_index
-            df_alt.attrs["data_record"] = data_rec_idx
-            df_alt.attrs["all_data_records"] = _all_recs
             df_alt.attrs["alignment_score"] = best.get("score")
-            df_alt.attrs["decode_method"] = "alignment"
-            return df_alt
+            return _set_attrs(df_alt, "alignment")
 
-    df.attrs["header_record"] = oes_header_index
-    df.attrs["data_record"] = data_rec_idx
-    df.attrs["all_data_records"] = _all_recs
-    return df
+    return _set_attrs(df, "conventional")

@@ -32,7 +32,7 @@ def _row_dtype(endian: str = "<") -> np.dtype:
 # Cached little-endian dtype for backwards compatibility
 _ROW_DTYPE = _row_dtype("<")
 
-OUT_COLS = ("GRID", "CP", "DX", "DY", "DZ", "RX", "RY", "RZ")
+OUT_COLS = ("GRID", "TX", "TY", "TZ", "RX", "RY", "RZ")
 
 
 def find_ougv1_headers(inv: OP2Inventory) -> List[int]:
@@ -127,10 +127,9 @@ def decode_ougv1(
     df = pd.DataFrame(
         {
             "GRID": (arr["dof_id"] // 10).astype(np.int32),
-            "CP": arr["cp"].astype(np.int32),
-            "DX": arr["dx"],
-            "DY": arr["dy"],
-            "DZ": arr["dz"],
+            "TX": arr["dx"],
+            "TY": arr["dy"],
+            "TZ": arr["dz"],
             "RX": arr["rx"],
             "RY": arr["ry"],
             "RZ": arr["rz"],

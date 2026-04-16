@@ -244,8 +244,8 @@ def load_data_bytes(
         first_idx = first_stress_record_after(inv, header_index)
     all_indices = collect_data_records_after(inv, first_idx, min_data_bytes)
     if len(all_indices) == 1:
-        return inv.records[first_idx].data, first_idx, all_indices
-    payload = b"".join(inv.records[i].data for i in all_indices)
+        return inv.get_record_data(first_idx), first_idx, all_indices
+    payload = b"".join(inv.get_record_data(i) for i in all_indices)
     return payload, first_idx, all_indices
 
 

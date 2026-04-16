@@ -70,6 +70,12 @@ def _find_ekeys_in_table(
     """
     Scan a result table and return one entry per element-type sub-block.
 
+    Scans forward from ``header_idx + 1`` until the next 8-byte table-name
+    record (which always marks the start of a new table/subcase group) or
+    the end of the inventory is reached.  No fixed-record-count limit is
+    imposed; the 8-byte boundary alone is sufficient because Nastran writes
+    all subcases of a given result type under a single table-name record.
+
     Returns
     -------
     list of (ekey_idx, first_data_idx, etype, numwde)
@@ -79,7 +85,7 @@ def _find_ekeys_in_table(
     records = inv.records
     n = len(records)
     i = header_idx + 1
-    while i < min(n, header_idx + 600):
+    while i < n:
         r = records[i]
         if r.info.length == 8:  # next table header
             break
