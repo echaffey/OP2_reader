@@ -1,4 +1,4 @@
-﻿# op2_native/decoders/oef1.py
+# op2_native/decoders/oef1.py
 """
 Decoder for OEF1 / OEF1X element force data blocks.
 
@@ -188,7 +188,7 @@ def _decode_oef1_shell_payload(
     payload: bytes,
     endian: str = "<",
     float_thr: float = 1e-6,
-    max_eid: int = 1_000_000,
+    max_eid: int = 99_999_999,
 ) -> pd.DataFrame:
     """
     Decode CQUAD4/CTRIA3 element forces: 11 words per element.
@@ -262,7 +262,7 @@ def _decode_oef1_shell_payload(
 def _decode_oef1_ctria3_payload(
     payload: bytes,
     endian: str = "<",
-    max_eid: int = 1_000_000,
+    max_eid: int = 99_999_999,
 ) -> pd.DataFrame:
     """
     Decode CTRIA3 element forces (NUMWDE=9, centroid only, EID-first layout).
@@ -302,7 +302,7 @@ def _decode_oef1_ctria3_payload(
 def _decode_oef1_shell_corner_payload(
     payload: bytes,
     endian: str = "<",
-    max_eid: int = 1_000_000,
+    max_eid: int = 99_999_999,
     max_grid: int = 10_000_000,
 ) -> pd.DataFrame:
     """
@@ -385,7 +385,7 @@ def _decode_oef1_bar_payload(
     payload: bytes,
     endian: str = "<",
     float_thr: float = 1e-6,
-    max_eid: int = 1_000_000,
+    max_eid: int = 99_999_999,
 ) -> pd.DataFrame:
     """
     Decode CBAR/CBEAM element forces: 9 words per element.
@@ -421,7 +421,7 @@ def _decode_oef1_bar_payload(
 def _decode_oef1_bush_payload(
     payload: bytes,
     endian: str = "<",
-    max_eid: int = 1_000_000,
+    max_eid: int = 99_999_999,
 ) -> pd.DataFrame:
     """
     Decode CBUSH element forces: 7 words per element.
@@ -458,7 +458,7 @@ def _decode_oef1_generic_payload(
     payload: bytes,
     endian: str = "<",
     float_thr: float = 1e-6,
-    max_eid: int = 1_000_000,
+    max_eid: int = 99_999_999,
 ) -> pd.DataFrame:
     """Decode OEF1 with generic F1..F8 column names (fallback for unknown types)."""
     import numpy as np
