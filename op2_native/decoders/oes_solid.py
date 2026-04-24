@@ -70,7 +70,7 @@ _OUT_COLS = ["EID", "GRID", "SX", "SY", "SZ", "SXY", "SYZ", "SZX", "VON_MISES"]
 # We only verify 109 here; other values fall back to _infer_nrows_per_elem.
 _EXT_CENTROID_WDS = 24  # words for centroid row (incl. grid_id word)
 _EXT_CORNER_WDS = 21  # words per corner row (incl. grid_id word)
-_EXT_NUMWDE_NROWS: dict[int, int] = {
+_EXT_NUMWDE_NROWS: Dict[int, int] = {
     109: 4,  # CTETRA MSC extended: 4 corners
     169: 6,  # CPENTA MSC extended: 6 corners (tentative)
 }
