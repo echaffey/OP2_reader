@@ -25,8 +25,6 @@ without pre-sorting.
 All arithmetic returns a new ResultArray; inputs are never mutated.
 """
 
-from __future__ import annotations
-
 import numpy as np
 from typing import Dict, List, Sequence, Tuple, Union
 

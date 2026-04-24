@@ -12,8 +12,6 @@ use strain-specific names (same layout as stress but with 'E' prefix):
   FD1, EX1, EY1, EXY1, EANG1, EMAJOR1, EMINOR1, EVM1,
   FD2, EX2, EY2, EXY2, EANG2, EMAJOR2, EMINOR2, EVM2
 """
-from __future__ import annotations
-
 import pandas as pd
 
 from ..models import OP2Inventory
@@ -63,7 +61,9 @@ _STRESS_TO_STRAIN = {
 }
 
 
-def decode_ostr1(inv: OP2Inventory, header_index: int, ekey_index: int = None) -> pd.DataFrame:
+def decode_ostr1(
+    inv: OP2Inventory, header_index: int, ekey_index: int = None
+) -> pd.DataFrame:
     """
     Decode an OSTR1 shell strain block.
 

@@ -35,10 +35,8 @@ Output columns
   SXY SYZ SZX  shear stresses
   VON_MISES    von Mises stress (or pressure P for some output requests)
 """
-from __future__ import annotations
-
 import struct
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -48,7 +46,7 @@ from .oes_peek import load_data_bytes
 
 # Map element-type code → number of grid-point rows per element
 # (centroid row + one row per corner node)
-_ETYPE_TO_NROWS: dict[int, int] = {
+_ETYPE_TO_NROWS: Dict[int, int] = {
     39: 5,  # CTETRA  (4 corners + 1 centroid)
     67: 7,  # CPENTA  (6 corners + 1 centroid)
     68: 9,  # CHEXA   (8 corners + 1 centroid)

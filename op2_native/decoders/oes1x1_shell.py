@@ -1,5 +1,4 @@
 # op2_native/decoders/oes1x1_shell.py
-from __future__ import annotations
 from typing import List, Tuple
 import struct
 import numpy as np

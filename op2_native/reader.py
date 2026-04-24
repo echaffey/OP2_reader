@@ -3,8 +3,6 @@
 Central OP2 class.  Open a file once; access any result type as a property
 or method.  All result methods return ``{subcase_id: DataFrame}``.
 """
-from __future__ import annotations
-
 import struct
 import warnings
 from pathlib import Path
@@ -95,7 +93,7 @@ class OP2:
 
     def __init__(
         self,
-        path: str | Path,
+        path: Union[str, Path],
         geometry: Union[bool, str, Path] = False,
     ) -> None:
         self.path = Path(path)

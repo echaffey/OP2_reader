@@ -19,8 +19,6 @@ plot_element_forces(df, component="NX", title=None)
 plot_stress_histogram(df, column="VON_MISES1", bins=40, title=None)
     Histogram of a stress/strain column across all elements.
 """
-from __future__ import annotations
-
 from typing import Optional
 
 import numpy as np

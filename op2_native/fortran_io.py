@@ -1,8 +1,7 @@
 # op2_native/fortran_io.py
-from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Iterator, Optional, Tuple
+from typing import BinaryIO, Iterator, Optional, Tuple, Union
 
 import io
 import struct
@@ -32,7 +31,7 @@ class FortranUnformattedReader:
         self._detected = False
 
     @classmethod
-    def open(cls, path: str | Path) -> "FortranUnformattedReader":
+    def open(cls, path: Union[str, Path]) -> "FortranUnformattedReader":
         fp = open(path, "rb")
         return cls(fp)
 
@@ -118,7 +117,7 @@ class FortranUnformattedReader:
             rec_index += 1
 
     # --- context manager support -------------------------------------------
-    def __enter__(self) -> FortranUnformattedReader:
+    def __enter__(self) -> "FortranUnformattedReader":
         # Ensure detection runs once you enter, so callers can immediately read .endian/.marker_size
         self.detect()
         return self

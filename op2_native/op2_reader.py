@@ -1,7 +1,6 @@
-from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Union
 import re
 
 from .fortran_io import FortranUnformattedReader, RecordInfo
@@ -15,7 +14,7 @@ class OP2Reader:
     Phase 1: non-decoding 'peeker'
     """
 
-    def __init__(self, path: str | Path):
+    def __init__(self, path: Union[str, Path]):
         self.path = Path(path)
         if not self.path.exists():
             raise FileNotFoundError(self.path)

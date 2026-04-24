@@ -33,8 +33,6 @@ CBEAM (etype 2):                            9 words/elem (centroid only in OEF1)
 Generic fallback:                           9 words/elem
   F1..F8
 """
-from __future__ import annotations
-
 import struct
 from typing import Dict, List, Optional
 

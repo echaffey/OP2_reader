@@ -18,8 +18,6 @@ Output columns
 --------------
   EID, EX, EY, EZ, ETX, ETY, ETZ
 """
-from __future__ import annotations
-
 from typing import List
 
 import numpy as np
@@ -65,7 +63,9 @@ def _decode_oes_cbush_payload(
     return pd.DataFrame(rows, columns=_CBUSH_STRESS_COLS)
 
 
-def decode_oes_cbush(inv: OP2Inventory, header_index: int, ekey_index: int = None) -> pd.DataFrame:
+def decode_oes_cbush(
+    inv: OP2Inventory, header_index: int, ekey_index: int = None
+) -> pd.DataFrame:
     """
     Decode a CBUSH OES1X1 block.
 

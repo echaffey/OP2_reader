@@ -19,11 +19,9 @@ Cards can be in either:
 
 Continuations ('+' at col 72, or '+' at start of next line) are handled.
 """
-from __future__ import annotations
-
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -141,7 +139,7 @@ _SOLID_CORNERS = {
 }
 
 
-def parse_dat(path: str | Path) -> GeomData:
+def parse_dat(path: Union[str, Path]) -> GeomData:
     """
     Parse grid coordinates and element connectivity from a Nastran .dat/.bdf.
 

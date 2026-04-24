@@ -42,8 +42,6 @@ Output columns (CBEAM -- one row per station per element)
 ---------------------------------------------------------
   EID, GRID, SD, SXC, SXD, SXE, SXF, SMAX, SMIN, MS_T, MS_C
 """
-from __future__ import annotations
-
 import struct
 from typing import List, Optional
 

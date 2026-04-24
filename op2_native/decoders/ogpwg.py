@@ -32,8 +32,6 @@ Practical output
 
 and a convenience DataFrame (``summary``) with human-readable rows.
 """
-from __future__ import annotations
-
 import struct
 from typing import Dict, Optional
 

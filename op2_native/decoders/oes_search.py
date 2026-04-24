@@ -1,5 +1,4 @@
 # op2_native/decoders/oes_search.py
-from __future__ import annotations
 import struct
 from typing import Dict, List, Tuple
 

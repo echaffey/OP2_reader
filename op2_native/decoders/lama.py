@@ -29,8 +29,6 @@ Output columns
     GENM       float   generalised mass
     GENSTIF    float   generalised stiffness
 """
-from __future__ import annotations
-
 import struct
 from typing import Dict, List
 
