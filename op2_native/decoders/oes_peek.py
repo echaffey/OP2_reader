@@ -148,7 +148,8 @@ def first_data_record_after_ekey(
     start = ekey_index + 1
     end = min(len(inv.records), start + max_ahead)
     for i in range(start, end):
-        if inv.records[i].info.length >= min_data_bytes:
+        L = inv.records[i].info.length
+        if L >= min_data_bytes and L not in _STRUCTURAL_RECORD_LENGTHS:
             return i
     raise ValueError(
         f"No data record (>= {min_data_bytes}B) found within "
