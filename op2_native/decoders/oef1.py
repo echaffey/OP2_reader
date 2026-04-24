@@ -39,7 +39,11 @@ from typing import Dict, List, Optional
 import pandas as pd
 
 from ..models import OP2Inventory
-from .oes_peek import load_data_bytes, first_data_record_after_ekey
+from .oes_peek import (
+    load_data_bytes,
+    first_data_record_after_ekey,
+    collect_paged_ekey_data,
+)
 
 # ---------------------------------------------------------------------------
 # Column name tables per element type
@@ -691,6 +695,15 @@ def decode_oef1(
         payload, data_idx, _all_recs = load_data_bytes(
             inv, header_index, min_data_bytes=min_db
         )
+
+    # If the solver wrote this subcase's data as multiple back-to-back
+    # (EKEY + small data) pages, collect and append all continuation pages
+    # before decoding.  This is common for large CBUSH models where each
+    # page may hold only 2 elements.
+    if ekey_index is not None and etype is not None and numwde:
+        extra = collect_paged_ekey_data(inv, ekey_index, etype, numwde, _all_recs)
+        if extra:
+            payload += extra
 
     if etype in _SHELL_ETYPES:
         if numwde == _CQUAD4_CORNER_NUMWDE:

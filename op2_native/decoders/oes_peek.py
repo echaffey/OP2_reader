@@ -265,6 +265,83 @@ def load_data_bytes(
     return payload, first_idx, all_indices
 
 
+def collect_paged_ekey_data(
+    inv: OP2Inventory,
+    first_ekey_idx: int,
+    etype: int,
+    numwde: int,
+    first_all_recs: List[int],
+) -> bytes:
+    """
+    Collect data from consecutive EKEY-paged records within the same logical
+    subcase.
+
+    Some Nastran solvers write large element result tables in *pages*: each
+    logical subcase contains multiple back-to-back ``(EKEY + DATA)`` pairs all
+    for the same element type.  The caller has already decoded the first page;
+    this function continues scanning forward from ``first_all_recs[-1] + 1``
+    and concatenates the raw bytes from every continuation page it finds.
+
+    Scanning stops unconditionally at the first:
+    - 8-byte table-name record (new result table), or
+    - 28-byte IDENT record (new subcase boundary).
+
+    Scanning also stops when a 584-byte record is found whose element type or
+    ``NUMWDE`` differs from the expected values (different sub-block).
+
+    Parameters
+    ----------
+    inv : OP2Inventory
+    first_ekey_idx : int
+        Record index of the first EKEY for this ``(etype, subcase)``.
+        Used only to orient callers; the actual scan begins from
+        ``first_all_recs[-1] + 1``.
+    etype : int
+        Element type code.  Continuation EKEYs must match this value.
+    numwde : int
+        Words per element row.  Continuation EKEYs must match this value.
+    first_all_recs : list of int
+        Indices of all data records collected for the first page (returned by
+        :func:`collect_data_records_after`).
+
+    Returns
+    -------
+    bytes
+        Concatenated raw payload from all continuation pages, or ``b""`` when
+        no continuation pages are found.
+    """
+    if not numwde:
+        return b""
+    min_db = numwde * 4
+    extra: List[bytes] = []
+    i = first_all_recs[-1] + 1
+    n = len(inv.records)
+    while i < n:
+        L = inv.records[i].info.length
+        if L in (8, 28):
+            # Table-name header or IDENT → new subcase / new table.  Stop.
+            break
+        if L == 584:
+            # Potential continuation EKEY — verify element type and numwde.
+            words = struct.unpack(f"{inv.endian}146i", inv.records[i].data)
+            page_etype = words[2] if words[2] != 0 else words[7]
+            page_numwde = words[9]
+            if page_etype == etype and page_numwde == numwde:
+                try:
+                    pf = first_data_record_after_ekey(inv, i, min_data_bytes=min_db)
+                    pa = collect_data_records_after(inv, pf, min_db)
+                    extra.extend(inv.get_record_data(j) for j in pa)
+                    i = pa[-1] + 1
+                    continue
+                except ValueError:
+                    break  # no data record found after this EKEY
+            else:
+                # Different element type — not a continuation of this block.
+                break
+        i += 1
+    return b"".join(extra)
+
+
 def _record_looks_like_grid_force_data(
     rec, endian: str = "<", row_widths=(8, 7), min_rows: int = 10
 ) -> bool:
