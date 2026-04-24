@@ -84,50 +84,30 @@ def _find_ekeys_in_table(
     records = inv.records
     n = len(records)
     i = header_idx + 1
-    # Structural record lengths — must never be treated as data records.
-    _STRUCT_LENS = frozenset({8, 28, 128, 584})
-    # Track which element types have already been added for the current
-    # logical subcase (i.e. since the last 28-byte IDENT record).  When a
-    # Nastran solver writes a large number of elements it may split the data
-    # for one subcase into multiple back-to-back (EKEY + small data) pairs —
-    # one "page" of elements per pair.  We only emit a result entry for the
-    # FIRST such EKEY; the decoder later collects all continuation pages.
-    seen_etypes: set = set()
     while i < n:
         r = records[i]
         if r.info.length == 8:  # next table header
             break
-        if r.info.length == 28:  # IDENT record → start of a new subcase group
-            seen_etypes = set()
         if r.info.length == 584:  # EKEY record
             ekey_i = i
             words = struct.unpack(f"{inv.endian}146i", r.data)
             etype = _etype_from_ekey_words(words)
             numwde = words[9]
             if etype > 0 and numwde > 0:
-                if etype not in seen_etypes:
-                    # First EKEY for this element type in the current subcase.
-                    seen_etypes.add(etype)
-                    # Look for a data block within the next 20 records.
-                    # Use numwde*4 as the minimum data size (1 element worth
-                    # of bytes) so small tables are not missed.  Also exclude
-                    # fixed structural records so an immediately following IDENT
-                    # or another EKEY is never misidentified as data.
-                    min_data_bytes = numwde * 4
-                    first_data: int = -1
-                    for j in range(ekey_i + 1, min(n, ekey_i + 20)):
-                        rj = records[j]
-                        if rj.info.length == 8:  # next table
-                            break
-                        if (
-                            rj.info.length >= min_data_bytes
-                            and rj.info.length not in _STRUCT_LENS
-                        ):
-                            first_data = j
-                            break
-                    if first_data >= 0:
-                        results.append((ekey_i, first_data, etype, numwde))
-                # else: continuation page EKEY for same etype in same subcase — skip.
+                # Look for a data block within the next 20 records.
+                # Use numwde*4 as the minimum data size (1 element worth of bytes)
+                # so small tables (e.g. 2 CTRIA3 elements = 72 bytes) are not missed.
+                min_data_bytes = numwde * 4
+                first_data: int = -1
+                for j in range(ekey_i + 1, min(n, ekey_i + 20)):
+                    rj = records[j]
+                    if rj.info.length == 8:  # next table
+                        break
+                    if rj.info.length >= min_data_bytes:
+                        first_data = j
+                        break
+                if first_data >= 0:
+                    results.append((ekey_i, first_data, etype, numwde))
         i += 1
     return results
 
