@@ -1,11 +1,11 @@
 # op2_native/decoders/ougv1.py
-from __future__ import annotations
 from typing import List, Optional
 import struct
 import numpy as np
 import pandas as pd
 
 from ..models import OP2Inventory, OP2Record
+from .oes_peek import collect_data_records_after, load_data_bytes
 
 ROW_FMT = (
     "ii6f"  # dof_id, cp (or similar), then 6 DOFs  (endian prefix added at runtime)
@@ -66,14 +66,23 @@ def classify_ougv1_headers(inv: OP2Inventory) -> List[tuple]:
             (b for b in boundaries if b > hdr_idx), len(inv.records) + 1
         )
         sc_offset = 0
+        skip_until = -1
         for r in inv.records:
             if r.info.index <= hdr_idx:
                 continue
             if r.info.index >= next_boundary:
                 break
+            if r.info.index <= skip_until:
+                continue
             if _looks_like_ougv1_data(r, inv.endian):
                 result.append((hdr_idx, r.info.index, sc_offset))
                 sc_offset += 1
+                # Skip continuation records so they are not mistaken for new subcases.
+                conts = collect_data_records_after(
+                    inv, r.info.index, min_data_bytes=ROW_SIZE
+                )
+                if len(conts) > 1:
+                    skip_until = conts[-1]
     return result
 
 
@@ -116,13 +125,13 @@ def decode_ougv1(
     data_idx = (
         ekey_idx if ekey_idx is not None else find_ougv1_data_record(inv, header_index)
     )
-    rec = next(r for r in inv.records if r.info.index == data_idx)
-    data = rec.data
-    L = rec.info.length
+    payload, _first, all_recs = load_data_bytes(
+        inv, header_index, min_data_bytes=ROW_SIZE, first_idx=data_idx
+    )
 
     # Trim to a whole number of rows then bulk-unpack with numpy
-    n_rows = L // ROW_SIZE
-    arr = np.frombuffer(data[: n_rows * ROW_SIZE], dtype=_row_dtype(inv.endian))
+    n_rows = len(payload) // ROW_SIZE
+    arr = np.frombuffer(payload[: n_rows * ROW_SIZE], dtype=_row_dtype(inv.endian))
 
     df = pd.DataFrame(
         {
@@ -137,5 +146,6 @@ def decode_ougv1(
     )
     df.attrs["source_header"] = header_index
     df.attrs["data_record"] = data_idx
+    df.attrs["all_data_records"] = all_recs
     df.attrs["row_format"] = ROW_FMT
     return df

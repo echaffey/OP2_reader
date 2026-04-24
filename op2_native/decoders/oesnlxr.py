@@ -54,8 +54,6 @@ Output columns (one row per node per element):
   EID, GRID, SX, SY, SZ, SXY, SYZ, SZX, VON_MISES, EFF_STRAIN_PLAS,
   EFF_CREEP, EX, EY, EZ, EXY, EYZ, EZX
 """
-from __future__ import annotations
-
 import struct
 from typing import Dict, List, Optional, Tuple
 
@@ -477,7 +475,9 @@ def decode_oesnlxr_cbeam(
 ) -> pd.DataFrame:
     """Decode CBEAM NL stress block from OESNLXR."""
     if ekey_index is not None:
-        first_idx = first_data_record_after_ekey(inv, ekey_index)
+        first_idx = first_data_record_after_ekey(
+            inv, ekey_index, min_data_bytes=_CBEAM_NL_NUMWDE * 4
+        )
         payload, data_idx, all_recs = load_data_bytes(
             inv, ekey_index, first_idx=first_idx
         )
@@ -497,7 +497,9 @@ def decode_oesnlxr_cbush(
 ) -> pd.DataFrame:
     """Decode CBUSH NL stress block from OESNLXR."""
     if ekey_index is not None:
-        first_idx = first_data_record_after_ekey(inv, ekey_index)
+        first_idx = first_data_record_after_ekey(
+            inv, ekey_index, min_data_bytes=_CBUSH_NL_NUMWDE * 4
+        )
         payload, data_idx, all_recs = load_data_bytes(
             inv, ekey_index, first_idx=first_idx
         )
@@ -517,7 +519,9 @@ def decode_oesnlxr_ctetra(
 ) -> pd.DataFrame:
     """Decode CTETRA NL stress block from OESNLXR."""
     if ekey_index is not None:
-        first_idx = first_data_record_after_ekey(inv, ekey_index)
+        first_idx = first_data_record_after_ekey(
+            inv, ekey_index, min_data_bytes=_CTETRA_NL_NUMWDE * 4
+        )
         payload, data_idx, all_recs = load_data_bytes(
             inv, ekey_index, first_idx=first_idx
         )

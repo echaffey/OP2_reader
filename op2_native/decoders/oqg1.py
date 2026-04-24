@@ -17,18 +17,19 @@ Layout (SORT1, real, static) — 8 words per row:
   We auto-detect the layout by checking whether the second word of the
   first few rows is an integer in a plausible cp range (0-999).
 """
-from __future__ import annotations
-
 import struct
-from typing import List
+from typing import List, Optional
 
 import numpy as np
 import pandas as pd
 
-from typing import List
-
 from ..models import OP2Inventory
-from .oes_peek import first_grid_force_record_after, classify_grid_force_headers
+from .oes_peek import (
+    first_grid_force_record_after,
+    classify_grid_force_headers,
+    load_data_bytes,
+    collect_data_records_after,
+)
 
 
 def classify_oqg_headers(inv: OP2Inventory) -> List[tuple]:
@@ -132,7 +133,7 @@ def _decode_grid_force_payload(
 
 
 def decode_oqg1(
-    inv: OP2Inventory, header_index: int, ekey_idx: int | None = None
+    inv: OP2Inventory, header_index: int, ekey_idx: Optional[int] = None
 ) -> pd.DataFrame:
     """
     Decode an OQG1 SPC/MPC force block.
@@ -152,10 +153,13 @@ def decode_oqg1(
         if ekey_idx is not None
         else first_grid_force_record_after(inv, header_index)
     )
-    rec = inv.records[data_idx]
-    df = _decode_grid_force_payload(rec.data, endian=inv.endian)
+    payload, _first, all_recs = load_data_bytes(
+        inv, header_index, min_data_bytes=32, first_idx=data_idx
+    )
+    df = _decode_grid_force_payload(payload, endian=inv.endian)
     df.attrs["header_record"] = header_index
     df.attrs["data_record"] = data_idx
+    df.attrs["all_data_records"] = all_recs
     return df
 
 
@@ -217,14 +221,21 @@ def classify_separation_headers(inv: OP2Inventory, token: str) -> List[tuple]:
             (b for b in boundaries if b > hdr_idx), len(inv.records) + 1
         )
         sc_offset = 0
+        skip_until = -1
         for r in inv.records:
             if r.info.index <= hdr_idx:
                 continue
             if r.info.index >= next_boundary:
                 break
+            if r.info.index <= skip_until:
+                continue
             if _record_looks_like_separation_data(r, inv.endian):
                 result.append((hdr_idx, r.info.index, sc_offset))
                 sc_offset += 1
+                # Skip continuation records so they are not mistaken for new subcases.
+                conts = collect_data_records_after(inv, r.info.index, min_data_bytes=16)
+                if len(conts) > 1:
+                    skip_until = conts[-1]
     return result
 
 
@@ -251,7 +262,7 @@ def _decode_separation_payload(
 
 
 def decode_separation(
-    inv: OP2Inventory, header_index: int, ekey_idx: int | None = None
+    inv: OP2Inventory, header_index: int, ekey_idx: Optional[int] = None
 ) -> pd.DataFrame:
     """
     Decode an OSPDSI1 or OSPDS1 contact separation distance block.
@@ -261,8 +272,11 @@ def decode_separation(
     DataFrame with columns ``GRID, DISTANCE``.
     """
     data_idx = ekey_idx if ekey_idx is not None else header_index + 1
-    rec = inv.records[data_idx]
-    df = _decode_separation_payload(rec.data, endian=inv.endian)
+    payload, _first, all_recs = load_data_bytes(
+        inv, header_index, min_data_bytes=16, first_idx=data_idx
+    )
+    df = _decode_separation_payload(payload, endian=inv.endian)
     df.attrs["header_record"] = header_index
     df.attrs["data_record"] = data_idx
+    df.attrs["all_data_records"] = all_recs
     return df

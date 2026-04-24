@@ -1,6 +1,5 @@
 # op2_native/decoders/oes_peek.py
-from __future__ import annotations
-from typing import List, Literal, Dict
+from typing import List, Dict, Optional
 import struct
 import math
 import pandas as pd
@@ -11,9 +10,9 @@ from ..models import OP2Inventory
 def _view_record_as(
     inv: OP2Inventory,
     rec_index: int,
-    kind: Literal["int32", "float32", "float64"],
+    kind: str,
     cols: int = 8,
-    max_items: int | None = 128,
+    max_items: Optional[int] = 128,
 ) -> pd.DataFrame:
     b = inv.records[rec_index].data
     step = 4 if kind in ("int32", "float32") else 8
@@ -157,6 +156,15 @@ def first_data_record_after_ekey(
     )
 
 
+# Nastran OP2 structural record sizes that must never be treated as data records,
+# regardless of how small min_data_bytes is set.
+#   8   = 8-byte table-name record
+#  28   = IDENT record (ACODE/TCODE/ISUBCASE header, 7 int32 words)
+# 128   = title/subtitle/label text records
+# 584   = EKEY geometry record (146 int32 words)
+_STRUCTURAL_RECORD_LENGTHS = frozenset({8, 28, 128, 584})
+
+
 def collect_data_records_after(
     inv: OP2Inventory, first_data_idx: int, min_data_bytes: int = 1000
 ) -> list:
@@ -188,15 +196,22 @@ def collect_data_records_after(
     i = first_data_idx + 1
     while i < len(inv.records):
         r = inv.records[i]
-        if r.info.length >= min_data_bytes:
+        if (
+            r.info.length >= min_data_bytes
+            and r.info.length not in _STRUCTURAL_RECORD_LENGTHS
+        ):
             # Another data block belonging to the same logical group
             records.append(i)
             i += 1
         elif r.info.length == 4:
-            # Single 4-byte separator: look ahead to see if more data follows
+            # Single 4-byte separator: look ahead to see if more data follows.
+            # The look-ahead must also exclude structural records (e.g. an IDENT
+            # that starts the next subcase is 28 bytes and would pass a naive
+            # "length >= 28" check when min_data_bytes == numwde*4 for CBUSH).
             if (
                 i + 1 < len(inv.records)
                 and inv.records[i + 1].info.length >= min_data_bytes
+                and inv.records[i + 1].info.length not in _STRUCTURAL_RECORD_LENGTHS
             ):
                 i += 1  # skip separator, continue to next data block
             else:
@@ -337,14 +352,22 @@ def classify_grid_force_headers(inv: OP2Inventory, token: str) -> List[tuple]:
             (b for b in boundaries if b > hdr_idx), len(inv.records) + 1
         )
         sc_offset = 0
+        skip_until = -1
         for r in inv.records:
             if r.info.index <= hdr_idx:
                 continue
             if r.info.index >= next_boundary:
                 break
+            if r.info.index <= skip_until:
+                continue
             if _record_looks_like_grid_force_data(r, inv.endian):
                 result.append((hdr_idx, r.info.index, sc_offset))
                 sc_offset += 1
+                # Skip continuation records of this subcase so they are not
+                # mistakenly counted as separate subcases.
+                conts = collect_data_records_after(inv, r.info.index, min_data_bytes=32)
+                if len(conts) > 1:
+                    skip_until = conts[-1]
     return result
 
 
