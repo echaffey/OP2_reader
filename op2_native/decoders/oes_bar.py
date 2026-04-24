@@ -1,4 +1,4 @@
-﻿# op2_native/decoders/oes_bar.py
+# op2_native/decoders/oes_bar.py
 """
 Decoder for bar/beam element (CBAR/CBEAM) stress/strain blocks
 from OES1X1 tables.
@@ -117,7 +117,7 @@ def _elem_type_from_ekey(inv: OP2Inventory, start_index: int) -> Optional[int]:
 def _decode_cbar_payload(
     data: bytes,
     endian: str = "<",
-    max_eid: int = 10_000_000,
+    max_eid: int = 99_999_999,
 ) -> pd.DataFrame:
     """Decode CBAR stress: 16 words per element."""
     n_words = len(data) // 4
@@ -151,7 +151,7 @@ def _decode_cbar_payload(
 def _decode_cbeam_payload(
     data: bytes,
     endian: str = "<",
-    max_eid: int = 10_000_000,
+    max_eid: int = 99_999_999,
 ) -> pd.DataFrame:
     """
     Decode CBEAM stress: 111 words per element.
