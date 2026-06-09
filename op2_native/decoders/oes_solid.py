@@ -206,8 +206,19 @@ def _decode_solid_payload_extended(
 
     Both centroid (GRID=0) and corner rows are emitted.
 
-    Row layout (centroid and corners share the same field positions):
-      [0]  grid_id (0 for centroid)
+    Centroid row layout (24 words, standard 8-word format + extra data):
+      [0]  GRID = 0
+      [1]  SX   (Normal-X)
+      [2]  SY   (Normal-Y)
+      [3]  SZ   (Normal-Z)
+      [4]  SXY  (Shear-XY)
+      [5]  SYZ  (Shear-YZ)
+      [6]  SZX  (Shear-ZX)
+      [7]  Von Mises
+      [8-23] additional centroid data (principal stresses, etc.), ignored
+
+    Corner row layout (21 words, extended format):
+      [0]  grid_id
       [1]  Normal-X  (SX)
       [2]  Shear-XY  (SXY)
       [3]  Principal-A
@@ -222,7 +233,6 @@ def _decode_solid_payload_extended(
       [16] Shear-ZX  (SZX)
       [17] Principal-C
       [18-20] LZ direction cosines
-      [21-23] (centroid only) trailing words, ignored
     """
     centroid_wds = _EXT_CENTROID_WDS  # 24
     corner_wds = _EXT_CORNER_WDS  # 21
@@ -238,7 +248,20 @@ def _decode_solid_payload_extended(
     rows: List[list] = []
     offset = 0
 
-    def _extract_row(base: int, grid: int) -> None:
+    def _extract_centroid(base: int) -> None:
+        # Standard 8-word layout: [GRID=0, SX, SY, SZ, SXY, SYZ, SZX, VM, ...]
+        sx = float(floats[base + 1])
+        sy = float(floats[base + 2])
+        sz = float(floats[base + 3])
+        sxy = float(floats[base + 4])
+        syz = float(floats[base + 5])
+        szx = float(floats[base + 6])
+        vm = float(floats[base + 7])
+        if np.isfinite(sx) and np.isfinite(sy) and np.isfinite(sz):
+            rows.append([eid, 0, sx, sy, sz, sxy, syz, szx, vm])
+
+    def _extract_corner(base: int, grid: int) -> None:
+        # Extended corner layout: SX[1], SXY[2], VM[8], SY[9], SYZ[10], SZ[15], SZX[16]
         sx = float(floats[base + 1])
         sxy = float(floats[base + 2])
         sy = float(floats[base + 9])
@@ -258,15 +281,14 @@ def _decode_solid_payload_extended(
         if not (1 <= loc <= 9 and 1 <= eid <= max_eid):
             break
 
-        # Centroid row (GRID=0): same field layout as corner rows.
-        cent_base = offset + 1
-        _extract_row(cent_base, 0)
+        # Centroid row (GRID=0): standard 8-word format.
+        _extract_centroid(offset + 1)
 
-        # Corner rows.
+        # Corner rows: extended 21-word format.
         for k in range(n_corners):
             cr_base = offset + 1 + centroid_wds + k * corner_wds
             grid = int(ints[cr_base])
-            _extract_row(cr_base, grid)
+            _extract_corner(cr_base, grid)
 
         offset += stride
 
