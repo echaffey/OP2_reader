@@ -295,6 +295,61 @@ def _decode_solid_payload_extended(
     return pd.DataFrame(rows, columns=_EXT_OUT_COLS)
 
 
+def dump_extended_centroid_layout(
+    inv: OP2Inventory,
+    ekey_or_hdr: int,
+    n_elements: int = 3,
+) -> None:
+    """
+    Diagnostic: print all words of the centroid and first corner row for
+    the first *n_elements* elements in an extended-format solid block.
+
+    Call this on a block known to be NUMWDE=109/169 to identify which word
+    positions hold which stress values.
+    """
+    payload, _, _ = load_data_bytes(inv, ekey_or_hdr)
+    rec = inv.records[ekey_or_hdr]
+    if rec.info.length != 584:
+        print("Not an EKEY record – cannot determine n_corners")
+        return
+    words = struct.unpack(f"{inv.endian}146i", rec.data)
+    numwde = words[9]
+    n_corners = _EXT_NUMWDE_NROWS.get(numwde)
+    if n_corners is None:
+        print(f"NUMWDE={numwde} not in extended map {list(_EXT_NUMWDE_NROWS)}")
+        return
+
+    centroid_wds = _EXT_CENTROID_WDS
+    corner_wds = _EXT_CORNER_WDS
+    stride = 1 + centroid_wds + n_corners * corner_wds
+
+    bo = "<" if inv.endian == "<" else ">"
+    n_words = len(payload) // 4
+    ints = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}i4")
+    floats = np.frombuffer(payload[: n_words * 4], dtype=f"{bo}f4")
+
+    offset = 0
+    elem_count = 0
+    while offset + stride <= n_words and elem_count < n_elements:
+        raw_eid = int(ints[offset])
+        if raw_eid <= 0:
+            break
+        eid = raw_eid // 10
+        print(f"\n=== EID {eid} ===")
+        print(f"{'pos':>4}  {'int32':>14}  {'float32':>14}")
+        print(f"{'---':>4}  {'------':>14}  {'-------':>14}")
+        print("-- centroid row (24 words) --")
+        cb = offset + 1
+        for j in range(centroid_wds):
+            print(f"[{j:2d}]  {int(ints[cb+j]):>14}  {float(floats[cb+j]):>14.6g}")
+        print("-- corner[0] row (21 words) --")
+        kb = offset + 1 + centroid_wds
+        for j in range(corner_wds):
+            print(f"[{j:2d}]  {int(ints[kb+j]):>14}  {float(floats[kb+j]):>14.6g}")
+        offset += stride
+        elem_count += 1
+
+
 def decode_oes_solid(
     inv: OP2Inventory, header_index: int, ekey_index: int = None
 ) -> pd.DataFrame:
