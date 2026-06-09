@@ -206,16 +206,23 @@ def _decode_solid_payload_extended(
 
     Both centroid (GRID=0) and corner rows are emitted.
 
-    Centroid row layout (24 words, standard 8-word format + extra data):
-      [0]  GRID = 0
-      [1]  SX   (Normal-X)
-      [2]  SY   (Normal-Y)
-      [3]  SZ   (Normal-Z)
-      [4]  SXY  (Shear-XY)
-      [5]  SYZ  (Shear-YZ)
-      [6]  SZX  (Shear-ZX)
-      [7]  Von Mises
-      [8-23] additional centroid data (principal stresses, etc.), ignored
+    Centroid row layout (24 words):
+      [0]   GRID = 0
+      [1-3] header words (mixed int/float, not stress data)
+      [4]   Normal-X  (SX)       ← same layout as corners, offset +3
+      [5]   Shear-XY  (SXY)
+      [6]   Principal-A
+      [7-9] LX direction cosines
+      [10]  Mean Pressure
+      [11]  Von Mises  (VM)
+      [12]  Normal-Y  (SY)
+      [13]  Shear-YZ  (SYZ)
+      [14]  Principal-B
+      [15-17] LY direction cosines
+      [18]  Normal-Z  (SZ)
+      [19]  Shear-ZX  (SZX)
+      [20]  Principal-C
+      [21-23] LZ direction cosines
 
     Corner row layout (21 words, extended format):
       [0]  grid_id
@@ -249,14 +256,15 @@ def _decode_solid_payload_extended(
     offset = 0
 
     def _extract_centroid(base: int) -> None:
-        # Standard 8-word layout: [GRID=0, SX, SY, SZ, SXY, SYZ, SZX, VM, ...]
-        sx = float(floats[base + 1])
-        sy = float(floats[base + 2])
-        sz = float(floats[base + 3])
-        sxy = float(floats[base + 4])
-        syz = float(floats[base + 5])
-        szx = float(floats[base + 6])
-        vm = float(floats[base + 7])
+        # Stress fields are at the same relative positions as corners, but shifted
+        # by 3 due to 3 header words at [1-3]. Corner field N → centroid field N+3.
+        sx = float(floats[base + 4])
+        sxy = float(floats[base + 5])
+        sy = float(floats[base + 12])
+        syz = float(floats[base + 13])
+        sz = float(floats[base + 18])
+        szx = float(floats[base + 19])
+        vm = float(floats[base + 11])
         if np.isfinite(sx) and np.isfinite(sy) and np.isfinite(sz):
             rows.append([eid, 0, sx, sy, sz, sxy, syz, szx, vm])
 
