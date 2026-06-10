@@ -844,24 +844,61 @@ class OP2:
             ),
         )
 
-    def solid_strains(self) -> Dict[int, pd.DataFrame]:
+    def solid_strains(
+        self,
+        location: str = "max",
+    ) -> Dict[int, pd.DataFrame]:
         """
         Decode all OSTR1 solid element strain blocks.
+
+        Parameters
+        ----------
+        location : {"max", "centroid", "all"}, default "max"
+            Same semantics as :meth:`solid_stresses`.
 
         Returns
         -------
         dict
             ``{subcase_id: DataFrame}`` with columns
-            ``EID, GRID, SX, SY, SZ, SXY, SYZ, SZX, VM``.
+            ``EID, SX, SY, SZ, SXY, SYZ, SZX, VON_MISES``
+            (plus ``GRID`` when ``location='all'``).
         """
-        return self._cached(
-            "solid_strains",
-            lambda: self._decode_all(
+        if location not in ("max", "centroid", "all"):
+            raise ValueError(
+                f"location must be 'max', 'centroid', or 'all', got {location!r}"
+            )
+
+        def _compute_all():
+            return self._decode_all(
                 classify_ostr_headers(self.inventory)[1],
                 decode_oes_solid,
                 "OSTR1-solid",
-            ),
-        )
+            )
+
+        all_data = self._cached("solid_strains_all", _compute_all)
+
+        if location == "all":
+            return all_data
+
+        cache_key = f"solid_strains_{location}"
+
+        def _compute():
+            strain_cols = ["SX", "SY", "SZ", "SXY", "SYZ", "SZX", "VON_MISES"]
+            out: Dict[int, pd.DataFrame] = {}
+            for sc, df in all_data.items():
+                present = [c for c in strain_cols if c in df.columns]
+                if location == "max":
+                    corners = df[df["GRID"] != 0]
+                    out[sc] = (
+                        corners.groupby("EID", sort=False)[present].max().reset_index()
+                    )
+                else:  # "centroid"
+                    out[sc] = df[df["GRID"] == 0][["EID"] + present].reset_index(
+                        drop=True
+                    )
+            return out
+
+        return self._cached(cache_key, _compute)
 
     def bush_strains(self) -> Dict[int, pd.DataFrame]:
         """
@@ -902,24 +939,61 @@ class OP2:
             ),
         )
 
-    def solid_strains_el(self) -> Dict[int, pd.DataFrame]:
+    def solid_strains_el(
+        self,
+        location: str = "max",
+    ) -> Dict[int, pd.DataFrame]:
         """
         Decode all OSTR1EL solid element strain blocks (element coordinate system).
+
+        Parameters
+        ----------
+        location : {"max", "centroid", "all"}, default "max"
+            Same semantics as :meth:`solid_stresses`.
 
         Returns
         -------
         dict
             ``{subcase_id: DataFrame}`` with columns
-            ``EID, GRID, SX, SY, SZ, SXY, SYZ, SZX, VM``.
+            ``EID, SX, SY, SZ, SXY, SYZ, SZX, VON_MISES``
+            (plus ``GRID`` when ``location='all'``).
         """
-        return self._cached(
-            "solid_strains_el",
-            lambda: self._decode_all(
+        if location not in ("max", "centroid", "all"):
+            raise ValueError(
+                f"location must be 'max', 'centroid', or 'all', got {location!r}"
+            )
+
+        def _compute_all():
+            return self._decode_all(
                 classify_ostr_el_headers(self.inventory)[1],
                 decode_oes_solid,
                 "OSTR1EL-solid",
-            ),
-        )
+            )
+
+        all_data = self._cached("solid_strains_el_all", _compute_all)
+
+        if location == "all":
+            return all_data
+
+        cache_key = f"solid_strains_el_{location}"
+
+        def _compute():
+            strain_cols = ["SX", "SY", "SZ", "SXY", "SYZ", "SZX", "VON_MISES"]
+            out: Dict[int, pd.DataFrame] = {}
+            for sc, df in all_data.items():
+                present = [c for c in strain_cols if c in df.columns]
+                if location == "max":
+                    corners = df[df["GRID"] != 0]
+                    out[sc] = (
+                        corners.groupby("EID", sort=False)[present].max().reset_index()
+                    )
+                else:  # "centroid"
+                    out[sc] = df[df["GRID"] == 0][["EID"] + present].reset_index(
+                        drop=True
+                    )
+            return out
+
+        return self._cached(cache_key, _compute)
 
     def bush_strains_el(self) -> Dict[int, pd.DataFrame]:
         """

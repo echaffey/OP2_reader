@@ -142,7 +142,7 @@ def _decode_cbar_payload(
             break
         vals = floats[base + 1 : base + stride]
         if not np.all(np.isfinite(vals)):
-            break
+            continue
         rows.append([eid] + vals.tolist())
 
     return pd.DataFrame(rows, columns=_CBAR_COLS)
