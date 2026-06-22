@@ -1,7 +1,6 @@
-/_*.py
+diagnostics/
 Nastran_OP2_Block_Types_and_SOL_Mapping.pdf
 testing-015.op2
-verify_f06.py
 **/__pycache__/
 **/*.pyc
 run_files/
