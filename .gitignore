@@ -5,3 +5,8 @@ verify_f06.py
 **/__pycache__/
 **/*.pyc
 run_files/
+femdata/
+*.ipynb
+*.egg-info/
+dist/
+build/

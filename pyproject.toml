@@ -13,3 +13,10 @@ dependencies = [
 
 [project.optional-dependencies]
 plots = ["plotly>=5.0"]
+
+[tool.setuptools]
+packages = ["op2_native", "op2_native.decoders"]
+
+[tool.setuptools.package-dir]
+op2_native = "."
+"op2_native.decoders" = "decoders"
