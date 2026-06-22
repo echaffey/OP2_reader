@@ -3,6 +3,7 @@
 Central OP2 class.  Open a file once; access any result type as a property
 or method.  All result methods return ``{subcase_id: DataFrame}``.
 """
+import re
 import struct
 import warnings
 from pathlib import Path
@@ -12,8 +13,9 @@ import numpy as np
 import pandas as pd
 
 from .fortran_io import FortranUnformattedReader
-from .models import OP2Inventory, OP2Record, SubcaseMeta
-from .op2_reader import OP2Reader
+from .models import OP2Inventory, OP2Record, SubcaseMeta, _HEAD_BYTES
+
+_ASCII_HINT_RE = re.compile(rb"[A-Z0-9_]{3,12}")
 
 # decoder imports
 from .decoders.ougv1 import find_ougv1_headers, classify_ougv1_headers, decode_ougv1
@@ -158,8 +160,56 @@ class OP2:
     def inventory(self) -> OP2Inventory:
         """Lazily scan the file and cache the record inventory."""
         if self._inv is None:
-            self._inv = OP2Reader(self.path).peek_inventory()
+            self._inv = self._peek_inventory()
         return self._inv
+
+    def _ascii_hint(self, payload: bytes, max_bytes: int = 96) -> str:
+        raw = payload[:max_bytes]
+        return "".join(chr(b) if 32 <= b <= 126 else "." for b in raw)
+
+    def _probable_table(self, payload: bytes) -> Optional[str]:
+        head = payload[:128]
+        cands = _ASCII_HINT_RE.findall(head)
+        tokens = [c.decode("ascii", "ignore") for c in cands if 4 <= len(c) <= 8]
+        if not tokens:
+            return None
+
+        def score(tok: str) -> int:
+            s = 0
+            if tok.startswith(("O", "G", "C", "E")):
+                s += 2
+            if tok in (
+                "OUG", "OES", "OEF", "OGP", "OQG", "OPG",
+                "OGS", "OGPWG", "GEOM1", "GEOM2", "CASECC",
+            ):
+                s += 3
+            s += min(len(tok), 8)
+            return s
+
+        tokens.sort(key=score, reverse=True)
+        return tokens[0]
+
+    def _peek_inventory(self, limit_records: Optional[int] = None) -> OP2Inventory:
+        recs: List[OP2Record] = []
+        with FortranUnformattedReader.open(self.path) as reader:
+            endian, msize = reader.detect()
+            for info, data in reader:
+                ascii_hint = self._ascii_hint(data)
+                name = self._probable_table(data)
+                stored = data if len(data) <= _HEAD_BYTES else data[:_HEAD_BYTES]
+                recs.append(
+                    OP2Record(
+                        info=info,
+                        data=stored,
+                        ascii_hint=ascii_hint,
+                        probable_table_name=name,
+                    )
+                )
+                if limit_records is not None and len(recs) >= limit_records:
+                    break
+        return OP2Inventory(
+            path=self.path, endian=endian, marker_size=msize, records=recs
+        )
 
     def _first_hit(self, tables: Dict[str, list]) -> Optional[int]:
         """Return the record index of the very first header across all token hits."""
